@@ -1,6 +1,9 @@
 use std::cell::{Cell, RefCell};
-use std::net::{TcpListener, TcpStream};
+use std::net::{
+    Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
+};
 
+use rustc_abi::Size;
 use rustc_const_eval::interpret::{InterpResult, interp_ok};
 use rustc_middle::throw_unsup_format;
 use rustc_target::spec::Os;
@@ -60,6 +63,8 @@ impl FileDescription for Socket {
     where
         Self: Sized,
     {
+        // Drop underlying socket if any exists
+        self.socket.replace(None);
         interp_ok(Ok(()))
     }
 
@@ -186,11 +191,42 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn connect(
         &mut self,
-        _socket: &OpTy<'tcx>,
-        _address: &OpTy<'tcx>,
+        socket: &OpTy<'tcx>,
+        address: &OpTy<'tcx>,
         _address_len: &OpTy<'tcx>,
     ) -> InterpResult<'tcx, Scalar> {
-        throw_unsup_format!("connect: socket connect is unsupported")
+        let this = self.eval_context_mut();
+
+        let socket = this.read_scalar(socket)?.to_i32()?;
+        let address = socket_address(address, "connect", this)?;
+
+        // Reject if isolation is enabled
+        if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
+            this.reject_in_isolation("`connect`", reject_with)?;
+            this.set_last_error(LibcError("EACCES"))?;
+            return interp_ok(Scalar::from_i32(-1));
+        }
+
+        // Get the file handle
+        let Some(fd) = this.machine.fds.get(socket) else {
+            return interp_ok(this.eval_libc("EBADF"));
+        };
+
+        let Some(socket) = fd.downcast::<Socket>() else {
+            // Man page specifies to return ENOTSOCK if `fd` is not a socket
+            return interp_ok(this.eval_libc("ENOTSOCK"));
+        };
+
+        match TcpStream::connect(address) {
+            Ok(stream) => {
+                socket.socket.replace(Some(SocketKind::TcpStream(stream)));
+                interp_ok(Scalar::from_i32(0))
+            }
+            Err(e) => {
+                this.set_last_error(e)?;
+                interp_ok(Scalar::from_i32(-1))
+            }
+        }
     }
 
     fn bind(
@@ -313,4 +349,70 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Scalar> {
         throw_unsup_format!("getpeername: socket getpeername is unsupported")
     }
+}
+
+fn socket_address<'tcx>(
+    address: &OpTy<'tcx>,
+    foreign_name: &'static str,
+    this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
+) -> InterpResult<'tcx, SocketAddr> {
+    // Initially, treat address as generic sockaddr just to extract the family field
+    let sockaddr_layout = this.libc_ty_layout("sockaddr");
+    let address = this.deref_pointer_as(address, sockaddr_layout)?;
+
+    let family_field = this.project_field_named(&address, "sa_family")?;
+    let family_layout = this.libc_ty_layout("sa_family_t");
+    let family = this.read_scalar(&family_field)?.to_int(family_layout.size)?;
+
+    // Depending on the family, decide whether it's IPv4 or IPv6 and use specialized layout
+    // to extract address and port
+    let socket_addr = if family == this.eval_libc_i32("AF_INET").into() {
+        let sockaddr_in_layout = this.libc_ty_layout("sockaddr_in");
+        let address = address.offset(Size::ZERO, sockaddr_in_layout, this)?;
+
+        let port_field = this.project_field_named(&address, "sin_port")?;
+        let port = this.read_scalar(&port_field)?.to_u16()?;
+
+        let addr_field = this.project_field_named(&address, "sin_addr")?;
+        let s_addr_field = this.project_field_named(&addr_field, "s_addr")?;
+        let addr_bits = this.read_scalar(&s_addr_field)?.to_u32()?;
+
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_bits(addr_bits.to_be()), port.to_be()))
+    } else if family == this.eval_libc_i32("AF_INET6").into() {
+        let sockaddr_in6_layout = this.libc_ty_layout("sockaddr_in6");
+        let address = address.offset(Size::ZERO, sockaddr_in6_layout, this)?;
+
+        let port_field = this.project_field_named(&address, "sin6_port")?;
+        let port = this.read_scalar(&port_field)?.to_u16()?;
+
+        let addr_field = this.project_field_named(&address, "sin6_addr")?;
+        let s_addr_field = this.project_field_named(&addr_field, "s6_addr")?.offset(
+            Size::ZERO,
+            this.machine.layouts.u128,
+            this,
+        )?;
+        let addr_bits = this.read_scalar(&s_addr_field)?.to_u128()?;
+
+        let flowinfo_field = this.project_field_named(&address, "sin6_flowinfo")?;
+        let flowinfo = this.read_scalar(&flowinfo_field)?.to_u32()?;
+
+        let scope_id_field = this.project_field_named(&address, "sin6_scope_id")?;
+        let scope_id = this.read_scalar(&scope_id_field)?.to_u32()?;
+
+        SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from_bits(addr_bits.to_be()),
+            port.to_be(),
+            flowinfo,
+            scope_id,
+        ))
+    } else {
+        // Socket of other type shouldn't be created in a first place and
+        // thus also no address family of another type should be supported
+        throw_unsup_format!(
+            "{foreign_name}: address family {family} is unsupported, \
+                            only AF_INET and AF_INET6 are allowed"
+        );
+    };
+
+    interp_ok(socket_addr)
 }
