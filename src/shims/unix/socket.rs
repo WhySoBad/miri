@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::net::{
     Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
 };
+use std::time::Duration;
 
 use rustc_abi::Size;
 use rustc_const_eval::interpret::{InterpResult, interp_ok};
@@ -229,6 +230,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
+    #[allow(unused)]
     fn bind(
         &mut self,
         _socket: &OpTy<'tcx>,
@@ -246,6 +248,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         throw_unsup_format!("listen: socket listen is unsupported")
     }
 
+    #[allow(unused)]
     fn accept4(
         &mut self,
         _sockfd: &OpTy<'tcx>,
@@ -256,6 +259,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         throw_unsup_format!("accept4: socket accept is unsupported")
     }
 
+    #[allow(unused)]
     fn send(
         &mut self,
         _socket: &OpTy<'tcx>,
@@ -266,6 +270,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         throw_unsup_format!("send: socket send is unsupported")
     }
 
+    #[allow(unused)]
     fn sendmsg(
         &mut self,
         _socket: &OpTy<'tcx>,
@@ -275,6 +280,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         throw_unsup_format!("sendmsg: socket sendmsg is unsupported")
     }
 
+    #[allow(unused)]
     fn recv(
         &mut self,
         _socket: &OpTy<'tcx>,
@@ -297,6 +303,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         throw_unsup_format!("recvfrom: socket recvfrom is unsupported")
     }
 
+    #[allow(unused)]
     fn recvmsg(
         &mut self,
         _socket: &OpTy<'tcx>,
@@ -312,15 +319,221 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn setsockopt(
         &mut self,
-        _socket: &OpTy<'tcx>,
-        _level: &OpTy<'tcx>,
-        _option_name: &OpTy<'tcx>,
-        _option_value: &OpTy<'tcx>,
-        _option_len: &OpTy<'tcx>,
+        socket: &OpTy<'tcx>,
+        level: &OpTy<'tcx>,
+        option_name: &OpTy<'tcx>,
+        option_value: &OpTy<'tcx>,
+        option_len: &OpTy<'tcx>,
     ) -> InterpResult<'tcx, Scalar> {
-        throw_unsup_format!("setsockopt: socket setsockopt is unsupported")
+        let this = self.eval_context_mut();
+
+        let socket = this.read_scalar(socket)?.to_i32()?;
+        let level = this.read_scalar(level)?.to_i32()?;
+        let option_name = this.read_scalar(option_name)?.to_i32()?;
+        let socklen_layout = this.libc_ty_layout("socklen_t");
+        let option_len = this.read_scalar(option_len)?.to_int(socklen_layout.size)?;
+
+        // Reject if isolation is enabled
+        if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
+            this.reject_in_isolation("`setsockopt`", reject_with)?;
+            this.set_last_error(LibcError("EACCES"))?;
+            return interp_ok(Scalar::from_i32(-1));
+        }
+
+        // Get the file handle
+        let Some(fd) = this.machine.fds.get(socket) else {
+            return interp_ok(this.eval_libc("EBADF"));
+        };
+
+        let Some(socket) = fd.downcast::<Socket>() else {
+            // Man page specifies to return ENOTSOCK if `fd` is not a socket
+            return interp_ok(this.eval_libc("ENOTSOCK"));
+        };
+
+        let inner = socket.socket.borrow();
+
+        // FIXME: Those are only the options used on linux targets
+        //        for other UNIX-like targets there might be additional
+        //        options which need to be supported
+
+        // Set options on socket level, needed for
+        // - [`TcpStream::set_read_timeout`]: SO_RCVTIMEO
+        // - [`TcpStream::set_write_timeout`]: SO_SNDTIMEO
+        // - [`TcpStream::set_linger`]: SO_LINGER
+        // - [`TcpListener::bind`]: SO_REUSEADDR
+        if level == this.eval_libc_i32("SOL_SOCKET") {
+            let opt_so_linger = this.eval_libc_i32("SO_LINGER");
+            let opt_so_rcvtimeo = this.eval_libc_i32("SO_RCVTIMEO");
+            let opt_so_sndtimeo = this.eval_libc_i32("SO_SNDTIMEO");
+            let opt_so_reuseaddr = this.eval_libc_i32("SO_REUSEADDR");
+
+            if option_name == opt_so_linger {
+                // TODO: [`TcpStream::set_linger`] is currently behind the `tcp_linger` feature, should it be shimmed anyways?
+
+                // let linger_layout = this.libc_ty_layout("linger");
+                // let option_value = this.deref_pointer_as(option_value, linger_layout)?;
+                // let onoff_field = this.project_field_named(&option_value, "l_onoff")?;
+                // let onoff = this.read_scalar(&onoff_field)?.to_bool()?;
+                // let linger_field = this.project_field_named(&option_value, "l_linger")?;
+                // let linger = this.read_scalar(&linger_field)?.to_int(linger_field.layout.size)?;
+
+                // let linger = if onoff {
+                //     // ignore conversion errors as standard library does the same
+                //     #[allow(clippy::as_conversions)]
+                //     let secs = linger as u64;
+                //     Some(Duration::from_secs(secs))
+                // } else {
+                //     None
+                // };
+
+                // match inner.as_ref() {
+                //     Some(SocketKind::TcpStream(stream)) =>
+                //         if let Err(e) = stream.set_linger(linger) {
+                //             this.set_last_error(e)?;
+                //             return interp_ok(Scalar::from_i32(-1));
+                //         },
+                //     _ =>
+                //         throw_unsup_format!(
+                //             "setsockopt: option SO_LINGER on level SOL_SOCKET can only be set on TCP sockets \
+                //                             after `connect` has been called"
+                //         ),
+                // }
+            } else if option_name == opt_so_rcvtimeo || option_name == opt_so_sndtimeo {
+                let timeval_layout = this.libc_ty_layout("timeval");
+                let option_value = this.deref_pointer_as(option_value, timeval_layout)?;
+                let sec_field = this.project_field_named(&option_value, "tv_sec")?;
+                let sec = this.read_scalar(&sec_field)?.to_int(sec_field.layout.size)?;
+                let usec_field = this.project_field_named(&option_value, "tv_usec")?;
+                let usec = this.read_scalar(&usec_field)?.to_int(usec_field.layout.size)?;
+
+                let timeout = if sec == 0 && usec == 0 {
+                    None
+                } else {
+                    // ignore conversion errors as standard library does the same
+                    #[allow(clippy::as_conversions)]
+                    let sec = sec as u64;
+                    #[allow(clippy::as_conversions)]
+                    let nsec = (usec as u32).saturating_mul(1000);
+                    Some(Duration::new(sec, nsec))
+                };
+
+                match inner.as_ref() {
+                    Some(SocketKind::TcpStream(stream)) if option_name == opt_so_rcvtimeo =>
+                        if let Err(e) = stream.set_read_timeout(timeout) {
+                            this.set_last_error(e)?;
+                            return interp_ok(Scalar::from_i32(-1));
+                        },
+                    Some(SocketKind::TcpStream(stream)) if option_name == opt_so_sndtimeo =>
+                        if let Err(e) = stream.set_write_timeout(timeout) {
+                            this.set_last_error(e)?;
+                            return interp_ok(Scalar::from_i32(-1));
+                        },
+                    _ if option_name == opt_so_rcvtimeo =>
+                        throw_unsup_format!(
+                            "setsockopt: option SO_RCVTIMEO on level SOL_SOCKET can only be set on TCP sockets \
+                                            after `connect` has been called"
+                        ),
+                    _ if option_name == opt_so_sndtimeo =>
+                        throw_unsup_format!(
+                            "setsockopt: option SO_SNDTIMEO on level SOL_SOCKET can only be set on TCP sockets \
+                                            after `connect` has been called"
+                        ),
+                    _ => unreachable!(),
+                }
+            } else if option_name == opt_so_reuseaddr {
+                let option_val = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                let flag_set = this.read_scalar(&option_val)?.to_bool()?;
+
+                if flag_set && inner.is_none() {
+                    // On non-windows targets this is set exactly once before calling `bind`. Since
+                    // we don't know the socket kind at this point we can't do much here.
+                    // See <https://github.com/rust-lang/rust/blob/c043085801b7a884054add21a94882216df5971c/library/std/src/sys/net/connection/socket/mod.rs#L552>
+                    //
+                    // TODO: Should we just ignore it as it should be taken care of [`TcpListener::bind`]?
+                    //       Should we enforce that it's called EXACTLY once before calling [`TcpListener::bind`]?
+                    //       If so, we probably should also error when this is called and afterwards we call [`TcpStream::connect`]
+                } else if !flag_set && inner.is_none() {
+                    throw_unsup_format!(
+                        "setsockopt: option SO_REUSEADDR on level SOL_SOCKET can only be set to `1`"
+                    )
+                } else {
+                    throw_unsup_format!(
+                        "setsockopt: option SO_REUSEADDR on level SOL_SOCKET can only be called before \
+                                        calling `bind` on a socket"
+                    )
+                }
+
+                todo!()
+            } else {
+                throw_unsup_format!(
+                    "setsockopt: option {option_name} is unsupported for level SOL_SOCKET, only \
+                                    SO_LINGER, SO_RCVTIMEO, SO_REUSEADDR and SO_SNDTIMEO are allowed",
+                );
+            }
+        } else
+        // Set options on TCP level, needed for
+        // - [`TcpStream::set_nodelay`]: TCP_NODELAY
+        // - [`TcpStream::set_quickack`]: TCP_QUICKACK
+        // - [`TcpStream::set_deferaccept`]: TCP_DEFER_ACCEPT
+        if level == this.eval_libc_i32("IPPROTO_TCP") {
+            let opt_tcp_nodelay = this.eval_libc_i32("TCP_NODELAY");
+            let opt_tcp_quickack = this.eval_libc_i32("TCP_QUICKACK");
+            let opt_tcp_defer_accept = this.eval_libc_i32("TCP_DEFER_ACCEPT");
+
+            if option_name == opt_tcp_nodelay {
+                todo!()
+            } else if option_name == opt_tcp_quickack {
+                todo!()
+            } else if option_name == opt_tcp_defer_accept {
+                todo!()
+            } else {
+                throw_unsup_format!(
+                    "setsockopt: option {option_name} is unsupported for level IPPROTO_TCP, only \
+                                    TCP_NODELAY, TCP_QUICKACK and TCP_DEFER_ACCEPT are allowed",
+                );
+            }
+        } else
+        // Set options on the IPv4 level, needed for
+        // - [`TcpStream::set_ttl`]: IP_TTL
+        // - [`TcpListener::set_ttl`]: IP_TTL
+        if level == this.eval_libc_i32("IPPROTO_IP") {
+            let opt_ip_ttl = this.eval_libc_i32("IP_TTL");
+
+            if option_name == opt_ip_ttl {
+                todo!()
+            } else {
+                throw_unsup_format!(
+                    "setsockopt: option {option_name} is unsupported for level IPPROTO_IP, only \
+                                    IP_TTL is allowed"
+                )
+            }
+        } else
+        // Set options on the IPv6 level, needed for
+        // - [`TcpListener::set_only_v6`]: IPV6_V6ONLY
+        if level == this.eval_libc_i32("IPPROTO_IPV6") {
+            let opt_ipv6_v6only = this.eval_libc_i32("IPV6_V6ONLY");
+
+            if option_name == opt_ipv6_v6only {
+                todo!()
+            } else {
+                throw_unsup_format!(
+                    "setsockopt: option {option_name} is unsupported for level IPPROTO_IPV6, only \
+                                    IPV6_V6ONLY is allowed"
+                )
+            }
+        } else {
+            throw_unsup_format!(
+                "setsockopt: level {level} is unsupported, only SOL_SOCKET, IPPROTO_TCP, \
+                                IPPROTO_IP and IPPROTO_IPV6 are allowed"
+            );
+        }
+
+        println!("level = {level}, option_name = {option_name}, option_len = {option_len}");
+
+        interp_ok(Scalar::from_i32(0))
     }
 
+    #[allow(unused)]
     fn getsockopt(
         &mut self,
         _socket: &OpTy<'tcx>,
@@ -332,6 +545,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         throw_unsup_format!("getsockopt: socket getsockopt is unsupported")
     }
 
+    #[allow(unused)]
     fn getsockname(
         &mut self,
         _socket: &OpTy<'tcx>,
@@ -341,6 +555,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         throw_unsup_format!("getsockname: socket getsockname is unsupported")
     }
 
+    #[allow(unused)]
     fn getpeername(
         &mut self,
         _socket: &OpTy<'tcx>,
