@@ -432,7 +432,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             } else if option_name == opt_so_reuseaddr {
                 let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
-                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
+                let flag_set = this.read_scalar(&option_value)?.to_u32()? == 1;
 
                 if flag_set && inner.is_none() {
                     // On non-windows targets this is set exactly once before calling `bind`. Since
@@ -470,7 +470,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             if option_name == opt_tcp_nodelay {
                 let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
-                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
+                let flag_set = this.read_scalar(&option_value)?.to_u32()? == 1;
+
                 match inner.as_ref() {
                     Some(SocketKind::TcpStream(stream)) =>
                         if let Err(e) = stream.set_nodelay(flag_set) {
@@ -487,7 +488,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 //       on a linux host?
 
                 let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
-                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
+                let flag_set = this.read_scalar(&option_value)?.to_u32()? == 1;
+
                 match inner.as_ref() {
                     Some(SocketKind::TcpStream(stream)) =>
                         if let Err(e) = stream.set_quickack(flag_set) {
@@ -575,7 +577,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             if option_name == opt_ipv6_v6only {
                 let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
-                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
+                let flag_set = this.read_scalar(&option_value)?.to_u32()? == 1;
 
                 match inner.as_ref() {
                     // TODO: [`TcpListener::set_only_v6`] is deprecated because the flag can only be set _before_ binding.
