@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::net::{
     Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
 };
+use std::os::linux::net::TcpStreamExt;
 use std::time::Duration;
 
 use rustc_abi::Size;
@@ -133,8 +134,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Reject if isolation is enabled
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`socket`", reject_with)?;
-            this.set_last_error(LibcError("EACCES"))?;
-            return interp_ok(Scalar::from_i32(-1));
+            return this.set_last_error_and_return_i32(LibcError("EACCES"));
         }
 
         let mut is_sock_nonblock = false;
@@ -204,8 +204,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Reject if isolation is enabled
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`connect`", reject_with)?;
-            this.set_last_error(LibcError("EACCES"))?;
-            return interp_ok(Scalar::from_i32(-1));
+            return this.set_last_error_and_return_i32(LibcError("EACCES"));
         }
 
         // Get the file handle
@@ -223,10 +222,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 socket.socket.replace(Some(SocketKind::TcpStream(stream)));
                 interp_ok(Scalar::from_i32(0))
             }
-            Err(e) => {
-                this.set_last_error(e)?;
-                interp_ok(Scalar::from_i32(-1))
-            }
+            Err(e) => this.set_last_error_and_return_i32(e),
         }
     }
 
@@ -323,21 +319,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         level: &OpTy<'tcx>,
         option_name: &OpTy<'tcx>,
         option_value: &OpTy<'tcx>,
-        option_len: &OpTy<'tcx>,
+        _option_len: &OpTy<'tcx>,
     ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
 
         let socket = this.read_scalar(socket)?.to_i32()?;
         let level = this.read_scalar(level)?.to_i32()?;
         let option_name = this.read_scalar(option_name)?.to_i32()?;
-        let socklen_layout = this.libc_ty_layout("socklen_t");
-        let option_len = this.read_scalar(option_len)?.to_int(socklen_layout.size)?;
 
         // Reject if isolation is enabled
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
             this.reject_in_isolation("`setsockopt`", reject_with)?;
-            this.set_last_error(LibcError("EACCES"))?;
-            return interp_ok(Scalar::from_i32(-1));
+            return this.set_last_error_and_return_i32(LibcError("EACCES"));
         }
 
         // Get the file handle
@@ -389,8 +382,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // match inner.as_ref() {
                 //     Some(SocketKind::TcpStream(stream)) =>
                 //         if let Err(e) = stream.set_linger(linger) {
-                //             this.set_last_error(e)?;
-                //             return interp_ok(Scalar::from_i32(-1));
+                //              return this.set_last_error_and_return_i32(e);
                 //         },
                 //     _ =>
                 //         throw_unsup_format!(
@@ -420,13 +412,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 match inner.as_ref() {
                     Some(SocketKind::TcpStream(stream)) if option_name == opt_so_rcvtimeo =>
                         if let Err(e) = stream.set_read_timeout(timeout) {
-                            this.set_last_error(e)?;
-                            return interp_ok(Scalar::from_i32(-1));
+                            return this.set_last_error_and_return_i32(e);
                         },
                     Some(SocketKind::TcpStream(stream)) if option_name == opt_so_sndtimeo =>
                         if let Err(e) = stream.set_write_timeout(timeout) {
-                            this.set_last_error(e)?;
-                            return interp_ok(Scalar::from_i32(-1));
+                            return this.set_last_error_and_return_i32(e);
                         },
                     _ if option_name == opt_so_rcvtimeo =>
                         throw_unsup_format!(
@@ -441,8 +431,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     _ => unreachable!(),
                 }
             } else if option_name == opt_so_reuseaddr {
-                let option_val = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
-                let flag_set = this.read_scalar(&option_val)?.to_bool()?;
+                let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
 
                 if flag_set && inner.is_none() {
                     // On non-windows targets this is set exactly once before calling `bind`. Since
@@ -462,8 +452,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                         calling `bind` on a socket"
                     )
                 }
-
-                todo!()
             } else {
                 throw_unsup_format!(
                     "setsockopt: option {option_name} is unsupported for level SOL_SOCKET, only \
@@ -481,11 +469,66 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let opt_tcp_defer_accept = this.eval_libc_i32("TCP_DEFER_ACCEPT");
 
             if option_name == opt_tcp_nodelay {
-                todo!()
+                let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
+                match inner.as_ref() {
+                    Some(SocketKind::TcpStream(stream)) =>
+                        if let Err(e) = stream.set_nodelay(flag_set) {
+                            return this.set_last_error_and_return_i32(e);
+                        },
+                    _ =>
+                        throw_unsup_format!(
+                            "setsockopt: option TCP_NODELAY on level IPPROTO_TCP can only be set on TCP sockets \
+                                            after `connect` has been called"
+                        ),
+                }
             } else if option_name == opt_tcp_quickack {
-                todo!()
+                // TODO: This is a linux-only feature. How are such methods shimmed? Or aren't they shimmed at all as it would only work
+                //       on a linux host?
+
+                let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
+                match inner.as_ref() {
+                    Some(SocketKind::TcpStream(stream)) =>
+                        if let Err(e) = stream.set_quickack(flag_set) {
+                            return this.set_last_error_and_return_i32(e);
+                        },
+                    _ =>
+                        throw_unsup_format!(
+                            "setsockopt: option TCP_QUICKACK on level IPPROTO_TCP can only be set on TCP sockets \
+                                            after `connect` has been called"
+                        ),
+                }
             } else if option_name == opt_tcp_defer_accept {
-                todo!()
+                // TODO: [`TcpStream::set_deferaccept`] is currently behind the `tcp_deferaccept` feature, should it be shimmed anyways?
+                //       Also, it's a linux-only feature. How are such methods shimmed? Or aren't they shimmed at all as it would only work
+                //       on a linux host?
+
+                // if !matches!(&this.tcx.sess.target.os, Os::Linux) {
+                //     panic!(
+                //         "`setsockopt` with option TCP_DEFER_ACCEPT on level IPPROTO_TCP should not be called on {}",
+                //         this.tcx.sess.target.os
+                //     );
+                // }
+
+                // let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                // let secs = this.read_scalar(&option_value)?.to_int(option_value.layout.size)?;
+
+                // // ignore conversion errors as standard library does the same
+                // #[allow(clippy::as_conversions)]
+                // let duration = Duration::from_secs(secs as _);
+
+                // match inner.as_ref() {
+                //     Some(SocketKind::TcpStream(stream)) =>
+                //         if let Err(e) = stream.set_deferaccept(duration) {
+                //              return this.set_last_error_and_return_i32(e)
+                //         },
+                //     _ =>
+                //         throw_unsup_format!(
+                //             "setsockopt: option TCP_DEFER_ACCEPT on level IPPROTO_TCP can only be set on TCP sockets \
+                //                         after `connect` has been called"
+                //         ),
+                // }
             } else {
                 throw_unsup_format!(
                     "setsockopt: option {option_name} is unsupported for level IPPROTO_TCP, only \
@@ -500,7 +543,24 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let opt_ip_ttl = this.eval_libc_i32("IP_TTL");
 
             if option_name == opt_ip_ttl {
-                todo!()
+                let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                let ttl = this.read_scalar(&option_value)?.to_u32()?;
+
+                match inner.as_ref() {
+                    Some(SocketKind::TcpStream(stream)) =>
+                        if let Err(e) = stream.set_ttl(ttl) {
+                            return this.set_last_error_and_return_i32(e);
+                        },
+                    Some(SocketKind::TcpListener(listener)) =>
+                        if let Err(e) = listener.set_ttl(ttl) {
+                            return this.set_last_error_and_return_i32(e);
+                        },
+                    _ =>
+                        throw_unsup_format!(
+                            "setsockopt: option IP_TTL on level IPPROTO_IP can only be set on TCP sockets \
+                                            after `connect` or `bind` has been called"
+                        ),
+                }
             } else {
                 throw_unsup_format!(
                     "setsockopt: option {option_name} is unsupported for level IPPROTO_IP, only \
@@ -514,7 +574,23 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let opt_ipv6_v6only = this.eval_libc_i32("IPV6_V6ONLY");
 
             if option_name == opt_ipv6_v6only {
-                todo!()
+                let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                let flag_set = this.read_scalar(&option_value)?.to_bool()?;
+
+                match inner.as_ref() {
+                    // TODO: [`TcpListener::set_only_v6`] is deprecated because the flag can only be set _before_ binding.
+                    //       Should we error here or should we call the deprecated function?
+                    #[allow(deprecated)]
+                    Some(SocketKind::TcpListener(listener)) =>
+                        if let Err(e) = listener.set_only_v6(flag_set) {
+                            return this.set_last_error_and_return_i32(e);
+                        },
+                    _ =>
+                        throw_unsup_format!(
+                            "setsockopt: option IPV6_V6ONLY on level IPPROTO_IPV6 can only be set on TCP sockets \
+                                            after `bind` has been called"
+                        ),
+                }
             } else {
                 throw_unsup_format!(
                     "setsockopt: option {option_name} is unsupported for level IPPROTO_IPV6, only \
@@ -527,8 +603,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                 IPPROTO_IP and IPPROTO_IPV6 are allowed"
             );
         }
-
-        println!("level = {level}, option_name = {option_name}, option_len = {option_len}");
 
         interp_ok(Scalar::from_i32(0))
     }
