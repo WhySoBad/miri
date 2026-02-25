@@ -183,4 +183,134 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         interp_ok(Scalar::from_i32(fds.insert(fd)))
     }
+
+    fn connect(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _address: &OpTy<'tcx>,
+        _address_len: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("connect: socket connect is unsupported")
+    }
+
+    fn bind(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _address: &OpTy<'tcx>,
+        _address_len: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("bind: socket bind is unsupported")
+    }
+
+    fn listen(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _backlog: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("listen: socket listen is unsupported")
+    }
+
+    fn accept4(
+        &mut self,
+        _sockfd: &OpTy<'tcx>,
+        _addr: &OpTy<'tcx>,
+        _addrlen: &OpTy<'tcx>,
+        _flags: Option<&OpTy<'tcx>>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("accept4: socket accept is unsupported")
+    }
+
+    fn send(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _buffer: &OpTy<'tcx>,
+        _length: &OpTy<'tcx>,
+        _flags: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("send: socket send is unsupported")
+    }
+
+    fn sendmsg(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _message: &OpTy<'tcx>,
+        _flags: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("sendmsg: socket sendmsg is unsupported")
+    }
+
+    fn recv(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _buffer: &OpTy<'tcx>,
+        _length: &OpTy<'tcx>,
+        _flags: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("recv: socket recv is unsupported")
+    }
+
+    fn recvfrom(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _buffer: &OpTy<'tcx>,
+        _length: &OpTy<'tcx>,
+        _flags: &OpTy<'tcx>,
+        _address: &OpTy<'tcx>,
+        _address_len: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("recvfrom: socket recvfrom is unsupported")
+    }
+
+    fn recvmsg(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _message: &OpTy<'tcx>,
+        _flags: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("recvmsg: socket recvmsg is unsupported")
+    }
+
+    fn shutdown(&mut self, _sockfd: &OpTy<'tcx>, _how: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("shutdown: socket shutdown is unsupported")
+    }
+
+    fn setsockopt(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _level: &OpTy<'tcx>,
+        _option_name: &OpTy<'tcx>,
+        _option_value: &OpTy<'tcx>,
+        _option_len: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("setsockopt: socket setsockopt is unsupported")
+    }
+
+    fn getsockopt(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _level: &OpTy<'tcx>,
+        _option_name: &OpTy<'tcx>,
+        _option_value: &OpTy<'tcx>,
+        _option_len: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("getsockopt: socket getsockopt is unsupported")
+    }
+
+    fn getsockname(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _address: &OpTy<'tcx>,
+        _address_len: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("getsockname: socket getsockname is unsupported")
+    }
+
+    fn getpeername(
+        &mut self,
+        _socket: &OpTy<'tcx>,
+        _address: &OpTy<'tcx>,
+        _address_len: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
+        throw_unsup_format!("getpeername: socket getpeername is unsupported")
+    }
 }
