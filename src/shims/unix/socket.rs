@@ -42,9 +42,6 @@ enum SocketState {
     /// The `listen` syscall has been called on the socket.
     /// This is only reachable from the [`SetupState::Bind`] state.
     TcpListener(TcpListener),
-    // /// The `connect` syscall has been called on the socket.
-    // /// This is only reachable from the [`SetupState::Initial`] and [`SetupState::NoSigpipe`] states.
-    // TcpStream(TcpStream),
 }
 
 #[allow(unused)]
@@ -212,7 +209,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             return interp_ok(this.eval_libc("ENOTSOCK"));
         };
 
-        let state = socket.state.borrow();
+        let mut state = socket.state.borrow_mut();
 
         // TODO: At the moment we do validation fo the parameters as good as we can. However,
         //       certain errors like EADDRINUSE won't be handled (for this we would need to check)
@@ -231,7 +228,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 if socket.family == address_family
                     || matches!(this.tcx.sess.target.os, Os::Dragonfly)
                 {
-                    socket.state.replace(SocketState::Bind(address));
+                    *state = SocketState::Bind(address);
                 } else {
                     // Attempted to bind an address from a family that doesn't match
                     // the family of the socket.
@@ -261,12 +258,66 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(Scalar::from_i32(0))
     }
 
-    fn listen(
-        &mut self,
-        _socket: &OpTy<'tcx>,
-        _backlog: &OpTy<'tcx>,
-    ) -> InterpResult<'tcx, Scalar> {
-        throw_unsup_format!("listen: socket listen is unsupported")
+    fn listen(&mut self, socket: &OpTy<'tcx>, backlog: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
+        let this = self.eval_context_mut();
+
+        let socket = this.read_scalar(socket)?.to_i32()?;
+        let backlog = this.read_scalar(backlog)?.to_i32()?;
+
+        // Reject if isolation is enabled
+        if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
+            this.reject_in_isolation("`bind`", reject_with)?;
+            return this.set_last_error_and_return_i32(LibcError("EACCES"));
+        }
+
+        // Get the file handle
+        let Some(fd) = this.machine.fds.get(socket) else {
+            return interp_ok(this.eval_libc("EBADF"));
+        };
+
+        let Some(socket) = fd.downcast::<Socket>() else {
+            // Man page specifies to return ENOTSOCK if `fd` is not a socket.
+            return interp_ok(this.eval_libc("ENOTSOCK"));
+        };
+
+        // All targets except Horizon and Haiku use a 128 backlog in the standard library.
+        let allowed_backlog = if matches!(this.tcx.sess.target.os, Os::Horizon) {
+            20
+        } else if matches!(this.tcx.sess.target.os, Os::Haiku) {
+            32
+        } else {
+            128
+        };
+
+        // Only allow same backlog values as the standard library uses since the standard library
+        // doesn't provide a way to use custom values.
+        if backlog != allowed_backlog {
+            throw_unsup_format!(
+                "listen: backlog {backlog} is unsupported, only {allowed_backlog} is allowed"
+            )
+        }
+
+        let mut state = socket.state.borrow_mut();
+
+        match &*state {
+            SocketState::Bind(socket_addr) =>
+                match TcpListener::bind(socket_addr) {
+                    Ok(listener) => {
+                        *state = SocketState::TcpListener(listener);
+                    }
+                    Err(e) => return this.set_last_error_and_return_i32(e),
+                },
+            SocketState::Initial => {
+                throw_unsup_format!(
+                    "listen: listening on a socket which isn't bound is unsupported"
+                )
+            }
+            SocketState::TcpListener(_) => {
+                throw_unsup_format!("listen: listening on a socket multiple times is unsupported")
+            }
+        }
+
+        interp_ok(Scalar::from_i32(0))
     }
 
     fn setsockopt(
@@ -307,7 +358,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         if level == this.eval_libc_i32("SOL_SOCKET") {
             let opt_so_reuseaddr = this.eval_libc_i32("SO_REUSEADDR");
 
-            if matches!(this.tcx.sess.target.os, Os::Linux | Os::Android | Os::FreeBsd) {
+            if matches!(this.tcx.sess.target.os, Os::MacOs | Os::NetBsd | Os::Dragonfly) {
                 // SO_NOSIGPIPE only exists on MacOS, FreeBSD, NetBSD and Dragonfly.
                 let opt_so_nosigpipe = this.eval_libc_i32("SO_NOSIGPIPE");
 
