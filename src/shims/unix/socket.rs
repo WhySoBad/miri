@@ -36,13 +36,6 @@ enum SocketKind {
 enum SocketState {
     /// No syscall after `socket` has been made.
     Initial,
-    // /// The socket option `SO_NOSIGPIPE` was set to `1`.
-    // /// This is only reachable from the [`SetupState::Initial`] state when being on MacOS, FreeBSD,
-    // /// NetBSD, or Dragonfly target.
-    // NoSigpipe,
-    // /// The socket option `SO_REUSEADDR` was set to `1`.
-    // /// This is only reachable from the [`SetupState::Initial`] and [`SetupState::NoSigpipe`] states.
-    // ReuseAddr,
     /// The `bind` syscall has been called on the socket.
     /// This is only reachable from the [`SetupState::NoSigpipe`] state.
     Bind(SocketAddr),
@@ -68,9 +61,12 @@ struct Socket {
     /// Whether this fd is non-blocking or not.
     is_non_block: Cell<bool>,
     /// Whether the `SO_NOSIGPIPE` socket option has been set.
-    /// This flag is only allowed on MacOS, FreeBSD, NetBSD and Dragonfly targets.
+    /// This option is only allowed on MacOS, FreeBSD, NetBSD, and Dragonfly targets and
+    /// can only be set directly after calling `socket` (before any other syscall interacts
+    /// with the socket).
     has_no_sig_pipe: Cell<bool>,
     /// Whether the `SO_REUSEADDR` socket option has been set.
+    /// This option can only be set before calling `bind`.
     has_reuse_addr: Cell<bool>,
 }
 
