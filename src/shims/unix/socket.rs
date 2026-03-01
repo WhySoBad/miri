@@ -37,10 +37,10 @@ enum SocketState {
     /// No syscall after `socket` has been made.
     Initial,
     /// The `bind` syscall has been called on the socket.
-    /// This is only reachable from the [`SetupState::NoSigpipe`] state.
+    /// This is only reachable from the [`SocketState::Initial`] state.
     Bind(SocketAddr),
     /// The `listen` syscall has been called on the socket.
-    /// This is only reachable from the [`SetupState::Bind`] state.
+    /// This is only reachable from the [`SocketState::Bind`] state.
     #[allow(unused)]
     TcpListener(TcpListener),
 }
