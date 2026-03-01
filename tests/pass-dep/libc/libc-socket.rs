@@ -30,7 +30,7 @@ fn test_socket_close() {
 fn test_bind_ipv4() {
     let sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
-    let addr = net::ipv4_sock_addr("127.0.0.1:1234").unwrap();
+    let addr = net::ipv4_sock_addr("0.0.0.0:1234").unwrap();
     unsafe {
         errno_check(libc::bind(
             sockfd,
@@ -44,7 +44,7 @@ fn test_bind_ipv4() {
 fn test_bind_ipv4_nosigpipe() {
     let sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
-    let addr = net::ipv4_sock_addr("127.0.0.1:1234").unwrap();
+    let addr = net::ipv4_sock_addr("0.0.0.0:1234").unwrap();
     unsafe {
         errno_check(libc::setsockopt(
             sockfd,
@@ -64,7 +64,7 @@ fn test_bind_ipv4_nosigpipe() {
 fn test_bind_ipv4_invalid_addr_len() {
     let sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
-    let addr = net::ipv4_sock_addr("127.0.0.1:1234").unwrap();
+    let addr = net::ipv4_sock_addr("0.0.0.0:1234").unwrap();
     let err = unsafe {
         errno_result(libc::bind(
             sockfd,
@@ -81,7 +81,7 @@ fn test_bind_ipv4_invalid_addr_len() {
 fn test_bind_ipv6() {
     let sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0)).unwrap() };
-    let addr = net::ipv6_sock_addr("[::1]:1234").unwrap();
+    let addr = net::ipv6_sock_addr("[::]:1234").unwrap();
     unsafe {
         errno_check(libc::bind(
             sockfd,
@@ -94,7 +94,7 @@ fn test_bind_ipv6() {
 fn test_listen() {
     let sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
-    let addr = net::ipv4_sock_addr("127.0.0.1:1234").unwrap();
+    let addr = net::ipv4_sock_addr("0.0.0.0:1234").unwrap();
     unsafe {
         errno_check(libc::setsockopt(
             sockfd,

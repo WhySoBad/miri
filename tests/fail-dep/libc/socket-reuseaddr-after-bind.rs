@@ -11,7 +11,7 @@ use libc_utils::*;
 fn main() {
     let sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
-    let addr = net::ipv4_sock_addr("127.0.0.1:1234").unwrap();
+    let addr = net::ipv4_sock_addr("0.0.0.0:1234").unwrap();
     unsafe {
         errno_check(libc::bind(
             sockfd,

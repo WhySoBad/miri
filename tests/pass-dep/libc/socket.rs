@@ -11,5 +11,5 @@ fn main() {
 }
 
 fn create_listener() {
-    let _listener = TcpListener::bind("127.0.0.1:1234").unwrap();
+    let _listener = TcpListener::bind("0.0.0.0:1234").unwrap();
 }
