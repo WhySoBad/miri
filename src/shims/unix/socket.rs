@@ -360,7 +360,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let mut available_options = vec!["SO_REUSEADDR"];
             let opt_so_reuseaddr = this.eval_libc_i32("SO_REUSEADDR");
 
-            if matches!(this.tcx.sess.target.os, Os::MacOs | Os::NetBsd | Os::Dragonfly) {
+            if matches!(
+                this.tcx.sess.target.os,
+                Os::MacOs | Os::FreeBsd | Os::NetBsd | Os::Dragonfly
+            ) {
                 available_options.push("SO_NOSIGPIPE");
                 // SO_NOSIGPIPE only exists on MacOS, FreeBSD, NetBSD and Dragonfly.
                 let opt_so_nosigpipe = this.eval_libc_i32("SO_NOSIGPIPE");
