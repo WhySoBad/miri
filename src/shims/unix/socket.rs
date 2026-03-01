@@ -41,6 +41,7 @@ enum SocketState {
     Bind(SocketAddr),
     /// The `listen` syscall has been called on the socket.
     /// This is only reachable from the [`SetupState::Bind`] state.
+    #[allow(unused)]
     TcpListener(TcpListener),
 }
 
@@ -186,12 +187,15 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         socket: &OpTy<'tcx>,
         address: &OpTy<'tcx>,
-        _address_len: &OpTy<'tcx>,
+        address_len: &OpTy<'tcx>,
     ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
 
         let socket = this.read_scalar(socket)?.to_i32()?;
-        let address = socket_address(address, "bind", this)?;
+        let address = match socket_address(address, address_len, "bind", this)? {
+            Ok(addr) => addr,
+            Err(e) => return this.set_last_error_and_return_i32(e),
+        };
 
         // Reject if isolation is enabled
         if let IsolatedOp::Reject(reject_with) = this.machine.isolated_op {
@@ -210,11 +214,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         let mut state = socket.state.borrow_mut();
-
-        // TODO: At the moment we do validation fo the parameters as good as we can. However,
-        //       certain errors like EADDRINUSE won't be handled (for this we would need to check)
-        //       whether the address is already in use on the current host. Should we "ignore" those
-        //       errors as they will be thrown when calling `listen`?
 
         match *state {
             SocketState::Initial => {
@@ -356,9 +355,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // - [`TcpListener::bind`]: SO_REUSEADDR
         // - [`TcpListener::bind`]: SO_NOSIGPIPE no MacOS, FreeBSD, NetBSD and Dragonfly
         if level == this.eval_libc_i32("SOL_SOCKET") {
+            // A list of available options which can later be displayed in the error should
+            // `option_name` be an invalid socket option.
+            let mut available_options = vec!["SO_REUSEADDR"];
             let opt_so_reuseaddr = this.eval_libc_i32("SO_REUSEADDR");
 
             if matches!(this.tcx.sess.target.os, Os::MacOs | Os::NetBsd | Os::Dragonfly) {
+                available_options.push("SO_NOSIGPIPE");
                 // SO_NOSIGPIPE only exists on MacOS, FreeBSD, NetBSD and Dragonfly.
                 let opt_so_nosigpipe = this.eval_libc_i32("SO_NOSIGPIPE");
 
@@ -368,7 +371,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     let flag_set = this.read_scalar(&option_value)?.to_u32()? == 1;
 
                     if matches!(*state, SocketState::Initial) {
-                        // This is set to 1 directly after calling `socket`.
+                        // This is set to 1 directly after calling `socket` in the standard library implementation.
                         // Since the standard library doesn't provide a way of setting this flag, we just ignore it.
                         if flag_set {
                             socket.has_no_sig_pipe.set(true);
@@ -383,6 +386,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                                 calling `bind` or `connect` on a socket"
                         )
                     }
+
+                    return interp_ok(Scalar::from_i32(0));
                 }
             }
 
@@ -391,7 +396,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let flag_set = this.read_scalar(&option_value)?.to_u32()? == 1;
 
                 if matches!(*state, SocketState::Initial) {
-                    // On non-windows targets this is set to 1 before calling `bind`.
+                    // On non-windows targets this is set to 1 before calling `bind` in the standard library implementation.
                     // Since the standard library doesn't provide a way of setting this flag, we just ignore it.
                     if flag_set {
                         socket.has_reuse_addr.set(true);
@@ -407,11 +412,15 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     )
                 }
             } else {
-                // TODO: This error message is not entirely correct as on MacOS and BSD targets
-                //       also SO_NOSIGPIPE is allowed
+                let options_str = match available_options.as_slice() {
+                    [] => unreachable!(),
+                    [head] => format!("{head} is allowed"),
+                    [init @ .., last] => format!("{} and {last} are allowed", init.join(", ")),
+                };
+
                 throw_unsup_format!(
                     "setsockopt: option {option_name} is unsupported for level SOL_SOCKET, only \
-                                        SO_REUSEADDR is allowed",
+                                        {options_str}",
                 );
             }
         } else {
@@ -424,13 +433,29 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     }
 }
 
+/// Attempt to turn an address and length operand into a standard library socket address.
+///
+/// Returns an IO error should the address length not match the address family length.
 fn socket_address<'tcx>(
     address: &OpTy<'tcx>,
+    address_len: &OpTy<'tcx>,
     foreign_name: &'static str,
     this: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
-) -> InterpResult<'tcx, SocketAddr> {
+) -> InterpResult<'tcx, Result<SocketAddr, IoError>> {
+    let socklen_layout = this.libc_ty_layout("socklen_t");
+    let address_len = this.read_scalar(address_len)?.to_int(socklen_layout.size)?;
+    // We only support socklen_t sizes which can be converted to u64 since the layout
+    // byte sizes are also at most an u64.
+    let Ok(address_len) = u64::try_from(address_len) else {
+        throw_unsup_format!("{foreign_name}: socket address length is not valid u64");
+    };
+
     // Initially, treat address as generic sockaddr just to extract the family field.
     let sockaddr_layout = this.libc_ty_layout("sockaddr");
+    if address_len < sockaddr_layout.size.bytes() {
+        // Address length should be at least as big as the generic sockaddr
+        return interp_ok(Err(LibcError("EINVAL")));
+    }
     let address = this.deref_pointer_as(address, sockaddr_layout)?;
 
     let family_field = this.project_field_named(&address, "sa_family")?;
@@ -441,6 +466,10 @@ fn socket_address<'tcx>(
     // to extract address and port.
     let socket_addr = if family == this.eval_libc_i32("AF_INET").into() {
         let sockaddr_in_layout = this.libc_ty_layout("sockaddr_in");
+        if address_len != sockaddr_in_layout.size.bytes() {
+            // Address length should be exactly the length of an IPv4 address
+            return interp_ok(Err(LibcError("EINVAL")));
+        }
         let address = address.offset(Size::ZERO, sockaddr_in_layout, this)?;
 
         let port_field = this.project_field_named(&address, "sin_port")?;
@@ -453,6 +482,10 @@ fn socket_address<'tcx>(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_bits(addr_bits.to_be()), port.to_be()))
     } else if family == this.eval_libc_i32("AF_INET6").into() {
         let sockaddr_in6_layout = this.libc_ty_layout("sockaddr_in6");
+        if address_len != sockaddr_in6_layout.size.bytes() {
+            // Address length should be exactly the length of an IPv6 address
+            return interp_ok(Err(LibcError("EINVAL")));
+        }
         let address = address.offset(Size::ZERO, sockaddr_in6_layout, this)?;
 
         let port_field = this.project_field_named(&address, "sin6_port")?;
@@ -487,5 +520,5 @@ fn socket_address<'tcx>(
         );
     };
 
-    interp_ok(socket_addr)
+    interp_ok(Ok(socket_addr))
 }

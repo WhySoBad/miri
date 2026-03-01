@@ -1,0 +1,19 @@
+error: unsupported operation: setsockopt: option SO_REUSEADDR on level SOL_SOCKET can only be set before calling `bind` on a socket
+  --> tests/fail-dep/libc/socket-reuseaddr-after-bind.rs:LL:CC
+   |
+LL |           let errno = libc::setsockopt
+   |  _____________________^
+LL | |             (sockfd,
+LL | |             libc::SOL_SOCKET,
+LL | |             libc::SO_REUSEADDR,
+LL | |             (&1 as *const libc::c_int).cast::<libc::c_void>(),
+LL | |             size_of::<libc::c_int>() as libc::socklen_t,
+LL | |         );
+   | |_________^ unsupported operation occurred here
+   |
+   = help: this is likely not a bug in the program; it indicates that the program performed an operation that Miri does not support
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+error: aborting due to 1 previous error
+
