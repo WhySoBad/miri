@@ -1,7 +1,7 @@
 //@ignore-target: windows # No libc socket on Windows
-//@ignore-target: solaris # socket is a macro for __xnet7_socket which has no shim
-//@ignore-target: illumos # socket is a macro for __xnet7_socket which has no shim
-//@ignore-target: netbsd # socket is a macro fro __socket30 which has no shim
+//@ignore-target: solaris # Socket is a macro for __xnet7_socket which has no shim
+//@ignore-target: illumos # Socket is a macro for __xnet7_socket which has no shim
+//@ignore-target: netbsd # Socket is a macro fro __socket30 which has no shim
 //@compile-flags: -Zmiri-disable-isolation
 
 #[path = "../../utils/libc.rs"]
