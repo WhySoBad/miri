@@ -422,13 +422,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 };
 
                 throw_unsup_format!(
-                    "setsockopt: option {option_name} is unsupported for level SOL_SOCKET, only \
+                    "setsockopt: option {option_name:#x} is unsupported for level SOL_SOCKET, only \
                                         {options_str}",
                 );
             }
         } else {
             throw_unsup_format!(
-                "setsockopt: level {level} is unsupported, only SOL_SOCKET is allowed"
+                "setsockopt: level {level:#x} is unsupported, only SOL_SOCKET is allowed"
             );
         }
 
@@ -518,7 +518,7 @@ fn socket_address<'tcx>(
         // Socket of other types shouldn't be created in a first place and
         // thus also no address family of another type should be supported.
         throw_unsup_format!(
-            "{foreign_name}: address family {family} is unsupported, \
+            "{foreign_name}: address family {family:#x} is unsupported, \
                             only AF_INET and AF_INET6 are allowed"
         );
     };
