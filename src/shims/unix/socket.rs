@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::time::Duration;
 use std::{io, iter};
 
 use mio::Interest;
@@ -509,21 +510,29 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let socket = this.read_scalar(socket)?.to_i32()?;
         let level = this.read_scalar(level)?.to_i32()?;
         let option_name = this.read_scalar(option_name)?.to_i32()?;
+        let option_value_ptr = this.read_pointer(option_value)?;
         let socklen_layout = this.libc_ty_layout("socklen_t");
-        let option_len = this.read_scalar(option_len)?.to_int(socklen_layout.size)?;
+        // We only support option lengths which can be stored in a u64 since the
+        // size of a layout in bytes is also stored in a u64.
+        let option_len: u64 =
+            this.read_scalar(option_len)?.to_int(socklen_layout.size)?.try_into().unwrap();
 
         // Get the file handle
         let Some(fd) = this.machine.fds.get(socket) else {
             return this.set_last_error_and_return_i32(LibcError("EBADF"));
         };
 
-        let Some(_socket) = fd.downcast::<Socket>() else {
+        let Some(socket) = fd.downcast::<Socket>() else {
             // Man page specifies to return ENOTSOCK if `fd` is not a socket.
             return this.set_last_error_and_return_i32(LibcError("ENOTSOCK"));
         };
 
+        let state = socket.state.borrow();
+
         if level == this.eval_libc_i32("SOL_SOCKET") {
             let opt_so_reuseaddr = this.eval_libc_i32("SO_REUSEADDR");
+            let opt_so_sndtimeo = this.eval_libc_i32("SO_SNDTIMEO");
+            let opt_so_rcvtimeo = this.eval_libc_i32("SO_RCVTIMEO");
 
             if matches!(this.tcx.sess.target.os, Os::MacOs | Os::FreeBsd | Os::NetBsd) {
                 // SO_NOSIGPIPE only exists on MacOS, FreeBSD, and NetBSD.
@@ -535,7 +544,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         return this.set_last_error_and_return_i32(LibcError("EINVAL"));
                     }
                     let option_value =
-                        this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                        this.ptr_to_mplace(option_value_ptr, this.machine.layouts.i32);
                     let _val = this.read_scalar(&option_value)?.to_i32()?;
                     // We entirely ignore this value since we do not support signals anyway.
 
@@ -548,11 +557,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // Option value should be C-int which is usually 4 bytes.
                     return this.set_last_error_and_return_i32(LibcError("EINVAL"));
                 }
-                let option_value = this.deref_pointer_as(option_value, this.machine.layouts.i32)?;
+                let option_value = this.ptr_to_mplace(option_value_ptr, this.machine.layouts.i32);
                 let _val = this.read_scalar(&option_value)?.to_i32()?;
                 // We entirely ignore this: std always sets REUSEADDR for us, and in the end it's more of a
                 // hint to bypass some arbitrary timeout anyway.
                 return interp_ok(Scalar::from_i32(0));
+            } else if option_name == opt_so_sndtimeo {
+                let timeout = match this.timeval(option_value_ptr, option_len)? {
+                    Ok(duration) if duration.is_zero() => None,
+                    Ok(duration) => Some(duration),
+                    Err(e) => return this.set_last_error_and_return_i32(e),
+                };
+            } else if option_name == opt_so_rcvtimeo {
             } else {
                 throw_unsup_format!(
                     "setsockopt: option {option_name:#x} is unsupported for level SOL_SOCKET",
@@ -890,6 +906,37 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         )?;
 
         interp_ok(Ok(()))
+    }
+
+    fn timeval(
+        &self,
+        option_value_ptr: Pointer,
+        option_len: u64,
+    ) -> InterpResult<'tcx, Result<Duration, IoError>> {
+        let this = self.eval_context_ref();
+
+        if option_value_ptr == Pointer::null() {
+            // The value is not part of the process address space.
+            return interp_ok(Err(LibcError("EFAULT")));
+        }
+
+        let timeval_layout = this.libc_ty_layout("timeval");
+
+        if timeval_layout.size.bytes() != option_len {
+            // The provided length doesn't match the length of the libc struct.
+            return interp_ok(Err(LibcError("EINVAL")));
+        }
+
+        let option_value = this.ptr_to_mplace(option_value_ptr, timeval_layout);
+        let sec_field = this.project_field_named(&option_value, "tv_sec")?;
+        let sec = this.read_scalar(&sec_field)?.to_int(sec_field.layout.size)?;
+        let usec_field = this.project_field_named(&option_value, "tv_usec")?;
+        let usec = this.read_scalar(&usec_field)?.to_int(usec_field.layout.size)?;
+
+        let sec = u64::try_from(sec).unwrap();
+        let nsec = u32::try_from(usec).unwrap().saturating_mul(1000);
+
+        interp_ok(Ok(Duration::new(sec, nsec)))
     }
 
     /// Block the thread until there's an incoming connection or an error occurred.
