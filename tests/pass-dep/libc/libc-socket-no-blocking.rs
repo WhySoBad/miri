@@ -204,7 +204,7 @@ fn test_send_recv_nonblock() {
         // Windows the receive buffer of a localhost socket dynamically
         // grows.
 
-        let fill_buf = [1u8; 500_000];
+        let fill_buf = [1u8; 5_000_000];
         // This fills the socket receive buffer and thus should start blocking.
         let err = unsafe {
             errno_result(libc_utils::net::send_all(
@@ -343,7 +343,7 @@ fn test_write_read_nonblock() {
         // Windows the receive buffer of a localhost socket dynamically
         // grows.
 
-        let fill_buf = [1u8; 500_000];
+        let fill_buf = [1u8; 5_000_000];
         // This fills the socket receive buffer and thus should start blocking.
         let err = unsafe {
             errno_result(libc_utils::write_all(

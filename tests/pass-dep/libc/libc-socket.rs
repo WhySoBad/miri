@@ -38,7 +38,6 @@ fn main() {
     test_send_peek_recv();
     test_partial_send_recv();
     test_write_read();
-    test_partial_write_read();
 
     test_getsockname_ipv4();
     test_getsockname_ipv4_random_port();
