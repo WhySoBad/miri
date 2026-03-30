@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::time::Duration;
 use std::{io, iter};
 
 use mio::Interest;
@@ -25,7 +26,7 @@ enum SocketFamily {
 
 enum SocketIoError {
     /// The socket is not yet ready. Either EINPROGRESS or ENOTCONNECTED occurred.
-    NotReady,
+    NotReady(io::Error),
     /// Any other kind of I/O error.
     Other(io::Error),
 }
@@ -33,8 +34,16 @@ enum SocketIoError {
 impl From<io::Error> for SocketIoError {
     fn from(value: io::Error) -> Self {
         match value.kind() {
-            io::ErrorKind::InProgress | io::ErrorKind::NotConnected => Self::NotReady,
+            io::ErrorKind::InProgress | io::ErrorKind::NotConnected => Self::NotReady(value),
             _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<SocketIoError> for IoError {
+    fn from(value: SocketIoError) -> Self {
+        match value {
+            SocketIoError::NotReady(e) | SocketIoError::Other(e) => IoError::HostError(e),
         }
     }
 }
@@ -72,7 +81,7 @@ impl SocketState {
     ///
     /// **Important**: On Windows hosts this function can only be used to ensure a socket is connected
     /// _after_ a [`Interest::WRITABLE`] event was received.
-    pub fn try_set_connected(&mut self) -> Result<(), SocketIoError> {
+    fn try_set_connected(&mut self) -> Result<(), SocketIoError> {
         // Further explanation of the limitation on Windows hosts:
         // Windows treats sockets which are connecting as connected until either the connection timeout hits
         // or an error occurs. Thus, the [`TcpStream::peer_addr`] method returns [`Ok`] with the provided peer
@@ -151,16 +160,26 @@ impl FileDescription for Socket {
     ) -> InterpResult<'tcx> {
         assert!(communicate_allowed, "cannot have `Socket` with isolation enabled!");
 
-        if !matches!(&*self.state.borrow(), SocketState::Connected(_)) {
-            // We can only receive from connected sockets. For all other
+        if !matches!(&*self.state.borrow(), SocketState::Connecting(_) | SocketState::Connected(_))
+        {
+            // We can only read from connecting and connected sockets. For all other
             // states we return a not connected error.
             return finish.call(ecx, Err(LibcError("ENOTCONN")));
         }
 
         // Since `read` is the same as `recv` with no flags, we just treat
         // the `read` as a `recv` here.
-        ecx.block_for_recv(self, ptr, len, /* should_peek */ false, finish);
 
+        if self.is_non_block.get() {
+            // We have a non-blocking socket and thus don't want to block until
+            // we can read.
+            let result = ecx.try_non_block_recv(&self, ptr, len, /* should_peek */ false)?;
+            return finish.call(ecx, result);
+        }
+
+        // The socket is in blocking mode and thus the read call should block
+        // until we can read some bytes from the socket.
+        ecx.block_for_recv(self, ptr, len, /* should_peek */ false, finish);
         interp_ok(())
     }
 
@@ -174,16 +193,26 @@ impl FileDescription for Socket {
     ) -> InterpResult<'tcx> {
         assert!(communicate_allowed, "cannot have `Socket` with isolation enabled!");
 
-        if !matches!(&*self.state.borrow(), SocketState::Connected(_)) {
-            // We can only send with connected sockets. For all other
+        if !matches!(&*self.state.borrow(), SocketState::Connecting(_) | SocketState::Connected(_))
+        {
+            // We can only write into connecting and connected sockets. For all other
             // states we return a not connected error.
             return finish.call(ecx, Err(LibcError("ENOTCONN")));
         }
 
         // Since `write` is the same as `send` with no flags, we just treat
         // the `write` as a `send` here.
-        ecx.block_for_send(self, ptr, len, finish);
 
+        if self.is_non_block.get() {
+            // We have a non-blocking socket and thus don't want to block until
+            // we can write.
+            let result = ecx.try_non_block_send(&self, ptr, len)?;
+            return finish.call(ecx, result);
+        }
+
+        // The socket is in blocking mode and thus the write call should block
+        // until we can write some bytes into the socket.
+        ecx.block_for_send(self, ptr, len, finish);
         interp_ok(())
     }
 
@@ -469,16 +498,27 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
 
         if socket.is_non_block.get() {
-            throw_unsup_format!("accept4: non-blocking accept is unsupported")
+            // We have a non-blocking socket and thus don't want to block until
+            // we can accept an incoming connection.
+            return match this.try_non_block_accept(
+                &socket,
+                address_ptr,
+                address_len_ptr,
+                is_client_sock_nonblock,
+                dest,
+            )? {
+                Ok(_) => interp_ok(()),
+                Err(e) => this.set_last_error_and_return(e, dest),
+            };
         }
 
         // The socket is in blocking mode and thus the accept call should block
         // until an incoming connection is ready.
         this.block_for_accept(
+            socket,
             address_ptr,
             address_len_ptr,
             is_client_sock_nonblock,
-            socket,
             dest.clone(),
         );
         interp_ok(())
@@ -539,7 +579,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         if socket.is_non_block.get() {
-            throw_unsup_format!("connect: non-blocking connect is unsupported");
+            // We have a non-blocking socket and thus don't want to block until
+            // the connection is established.
+
+            // Since the [`TcpStream::connect`] function of mio hides the EINPROGRESS
+            // we just always return EINPROGRESS and check whether the connection succeeded
+            // once we want to use the connected socket.
+            return this.set_last_error_and_return(LibcError("EINPROGRESS"), dest);
         }
 
         // The socket is in blocking mode and thus the connect call should block
@@ -576,8 +622,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             return this.set_last_error_and_return(LibcError("ENOTSOCK"), dest);
         };
 
-        if !matches!(&*socket.state.borrow(), SocketState::Connected(_)) {
-            // We can only send with connected sockets. For all other
+        if !matches!(
+            &*socket.state.borrow(),
+            SocketState::Connecting(_) | SocketState::Connected(_)
+        ) {
+            // We can only send into connecting and connected sockets. For all other
             // states we return a not connected error.
             return this.set_last_error_and_return(LibcError("ENOTCONN"), dest);
         }
@@ -619,6 +668,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let dest = dest.clone();
 
+        if socket.is_non_block.get() {
+            // We have a non-blocking socket and thus don't want to block until
+            // we can send.
+            return match this.try_non_block_send(&socket, buffer_ptr, length)? {
+                Ok(size) => this.write_ssize(size, dest),
+                Err(e) => this.set_last_error_and_return(e, &dest),
+            };
+        }
+
+        // The socket is in blocking mode and thus the send call should block
+        // until we can send some bytes into the socket.
         this.block_for_send(
             socket,
             buffer_ptr,
@@ -627,16 +687,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 dest: MPlaceTy<'tcx>
             } |this, result: Result<usize, IoError>| {
                 match result {
-                    Ok(read_size) => {
-                        let read_size: u64 = read_size.try_into().unwrap();
-                        let ssize_layout = this.libc_ty_layout("ssize_t");
-                        this.write_scalar(Scalar::from_int(read_size, ssize_layout.size), &dest)
-                    }
+                    Ok(size) => this.write_ssize(size, dest),
                     Err(e) => this.set_last_error_and_return(e, &dest)
                 }
             }),
         );
-
         interp_ok(())
     }
 
@@ -668,8 +723,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             return this.set_last_error_and_return(LibcError("ENOTSOCK"), dest);
         };
 
-        if !matches!(&*socket.state.borrow(), SocketState::Connected(_)) {
-            // We can only receive from connected sockets. For all other
+        if !matches!(
+            &*socket.state.borrow(),
+            SocketState::Connecting(_) | SocketState::Connected(_)
+        ) {
+            // We can only receive from connecting and connected sockets. For all other
             // states we return a not connected error.
             return this.set_last_error_and_return(LibcError("ENOTCONN"), dest);
         }
@@ -719,6 +777,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let dest = dest.clone();
 
+        if socket.is_non_block.get() {
+            // We have a non-blocking socket and thus don't want to block until
+            // we can receive.
+            return match this.try_non_block_recv(&socket, buffer_ptr, length, should_peek)? {
+                Ok(size) => this.write_ssize(size, dest),
+                Err(e) => this.set_last_error_and_return(e, &dest),
+            };
+        }
+
+        // The socket is in blocking mode and thus the receive call should block
+        // until we can receive some bytes from the socket.
         this.block_for_recv(
             socket,
             buffer_ptr,
@@ -728,16 +797,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 dest: MPlaceTy<'tcx>
             } |this, result: Result<usize, IoError>| {
                 match result {
-                    Ok(read_size) => {
-                        let read_size: u64 = read_size.try_into().unwrap();
-                        let ssize_layout = this.libc_ty_layout("ssize_t");
-                        this.write_scalar(Scalar::from_int(read_size, ssize_layout.size), &dest)
-                    }
+                    Ok(size) => this.write_ssize(size, dest),
                     Err(e) => this.set_last_error_and_return(e, &dest)
                 }
             }),
         );
-
         interp_ok(())
     }
 
@@ -871,7 +935,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         socket: &OpTy<'tcx>,
         address: &OpTy<'tcx>,
         address_len: &OpTy<'tcx>,
-    ) -> InterpResult<'tcx, Scalar> {
+        // Location where the output scalar is written to.
+        dest: &MPlaceTy<'tcx>,
+    ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
         let socket = this.read_scalar(socket)?.to_i32()?;
@@ -880,31 +946,97 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // Get the file handle
         let Some(fd) = this.machine.fds.get(socket) else {
-            return this.set_last_error_and_return_i32(LibcError("EBADF"));
+            return this.set_last_error_and_return(LibcError("EBADF"), dest);
         };
 
         let Some(socket) = fd.downcast::<Socket>() else {
             // Man page specifies to return ENOTSOCK if `fd` is not a socket.
-            return this.set_last_error_and_return_i32(LibcError("ENOTSOCK"));
+            return this.set_last_error_and_return(LibcError("ENOTSOCK"), dest);
         };
 
         assert!(this.machine.communicate(), "cannot have `Socket` with isolation enabled!");
 
         let state = socket.state.borrow();
 
-        let SocketState::Connected(stream) = &*state else {
-            // We can only read the peer address of connected sockets.
-            return this.set_last_error_and_return_i32(LibcError("ENOTCONN"));
-        };
+        match &*state {
+            SocketState::Connected(stream) => {
+                let address = match stream.peer_addr() {
+                    Ok(address) => address,
+                    Err(e) => return this.set_last_error_and_return(e, dest),
+                };
 
-        let address = match stream.peer_addr() {
-            Ok(address) => address,
-            Err(e) => return this.set_last_error_and_return_i32(e),
-        };
+                match this.write_socket_address(
+                    &address,
+                    address_ptr,
+                    address_len_ptr,
+                    "getpeername",
+                )? {
+                    Ok(_) => this.write_scalar(Scalar::from_i32(0), dest),
+                    Err(e) => this.set_last_error_and_return(e, dest),
+                }
+            }
+            SocketState::Connecting(_) => {
+                // On Windows hosts, for the reason explained in [`SocketState::try_set_connected`], we need
+                // to ensure that the connection is established before "trusting" the output of [`TcpStream::peer_addr`].
+                // This is not necessary for UNIX hosts but it also works, so we use the same code for all hosts.
 
-        match this.write_socket_address(&address, address_ptr, address_len_ptr, "getpeername")? {
-            Ok(_) => interp_ok(Scalar::from_i32(0)),
-            Err(e) => this.set_last_error_and_return_i32(e),
+                drop(state);
+                let dest = dest.clone();
+
+                // Block with a zero duration. Since we first poll before handling expired timeouts in
+                // the scheduler, we know that the connection is established when the thread unblocks
+                // with [`UnblockKind::Ready`].
+                this.block_thread_for_io(
+                    socket.clone(),
+                    Interest::WRITABLE,
+                    Some((TimeoutClock::Monotonic, TimeoutAnchor::Absolute, Duration::ZERO)),
+                    callback!(
+                        @capture<'tcx> {
+                            socket: FileDescriptionRef<Socket>,
+                            address_ptr: Pointer,
+                            address_len_ptr: Pointer,
+                            dest: MPlaceTy<'tcx>
+                        } |this, kind: UnblockKind| {
+                            if let UnblockKind::TimedOut = kind {
+                                // The socket is not yet connected.
+                                this.machine.blocking_io.deregister(this.active_thread());
+                                return this.set_last_error_and_return(LibcError("ENOTCONN"), &dest);
+                            }
+
+                            // The thread woke up because it's ready. This means
+                            // the socket is writeable.
+
+                            let mut state = socket.state.borrow_mut();
+                            if let Err(e) = state.try_set_connected() {
+                                return this.set_last_error_and_return(e, &dest)
+                            }
+
+                            let SocketState::Connected(stream) = &*state else {
+                                // We checked that the socket is currently connecting.
+                                // Since we're guaranteed that [`SocketState::try_set_connected`]
+                                // only returns `Ok(_)` after an [`Interest::WRITEABLE`] event when the
+                                // socket is not connecting, this should be unreachable.
+                                unreachable!()
+                            };
+
+                            let address = match stream.peer_addr() {
+                                Ok(address) => address,
+                                Err(e) => return this.set_last_error_and_return(e, &dest),
+                            };
+
+                            match this.write_socket_address(&address, address_ptr, address_len_ptr, "getpeername")? {
+                                Ok(_) => this.write_scalar(Scalar::from_i32(0), &dest),
+                                Err(e) => this.set_last_error_and_return(e, &dest),
+                            }
+                        }
+                    ),
+                );
+                interp_ok(())
+            }
+            _ => {
+                // We can only read the peer address of connecting and connected sockets.
+                this.set_last_error_and_return(LibcError("ENOTCONN"), dest)
+            }
         }
     }
 }
@@ -1179,15 +1311,23 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(Ok(()))
     }
 
+    /// Attempt to write an integer as a [`libc::ssize_t`] into a memory location.
+    fn write_ssize(&mut self, size: usize, dest: MPlaceTy<'tcx>) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let size: u64 = size.try_into().unwrap();
+        let ssize_layout = this.libc_ty_layout("ssize_t");
+        this.write_scalar(Scalar::from_int(size, ssize_layout.size), &dest)
+    }
+
     /// Block the thread until there's an incoming connection or an error occurred.
     ///
     /// This recursively calls itself should the operation still block for some reason.
     fn block_for_accept(
         &mut self,
+        socket: FileDescriptionRef<Socket>,
         address_ptr: Pointer,
         address_len_ptr: Pointer,
         is_client_sock_nonblock: bool,
-        socket: FileDescriptionRef<Socket>,
         dest: MPlaceTy<'tcx>,
     ) {
         let this = self.eval_context_mut();
@@ -1204,53 +1344,71 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             } |this, kind: UnblockKind| {
                 assert_eq!(kind, UnblockKind::Ready);
 
-                let state = socket.state.borrow();
-
-                let SocketState::Listening(listener) = &*state else {
-                    // We checked that the socket is in listening state before blocking
-                    // and since there is no outgoing transition from that state this
-                    // should be unreachable.
-                    unreachable!()
-                };
-
-                let (stream, addr) = match listener.accept() {
-                    Ok(peer) => peer,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                match this.try_non_block_accept(&socket, address_ptr, address_len_ptr, is_client_sock_nonblock, &dest)? {
+                    Ok(_) => interp_ok(()),
+                    Err(IoError::HostError(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                         // We need to block the thread again as it would still block.
-                        drop(state);
-                        this.block_for_accept(address_ptr, address_len_ptr, is_client_sock_nonblock, socket, dest);
-                        return interp_ok(())
-                    },
-                    Err(e) => return this.set_last_error_and_return(e, &dest),
-                };
-
-                let family = match addr {
-                    SocketAddr::V4(_) => SocketFamily::IPv4,
-                    SocketAddr::V6(_) => SocketFamily::IPv6,
-                };
-
-                if address_ptr != Pointer::null() {
-                    // We only attempt a write if the address pointer is not a null pointer.
-                    // If the address pointer is a null pointer the user isn't interested in the
-                    // address and we don't need to write anything.
-                    if let Err(e) = this.write_socket_address(&addr, address_ptr, address_len_ptr, "accept4")? {
-                      return this.set_last_error_and_return(e, &dest);
-                    };
+                        this.block_for_accept(socket, address_ptr, address_len_ptr, is_client_sock_nonblock, dest);
+                        interp_ok(())
+                    }
+                    Err(e) => this.set_last_error_and_return(e, &dest),
                 }
-
-                let fd = this.machine.fds.new_ref(Socket {
-                    family,
-                    state: RefCell::new(SocketState::Connected(stream)),
-                    is_non_block: Cell::new(is_client_sock_nonblock),
-                });
-                let sockfd = this.machine.fds.insert(fd);
-                // We need to create the scalar using the destination size since
-                // `syscall(SYS_accept4, ...)` returns a long which doesn't match
-                // the int returned from the `accept`/`accept4` syscalls.
-                // See <https://man7.org/linux/man-pages/man2/syscall.2.html>.
-                this.write_scalar(Scalar::from_int(sockfd, dest.layout.size), &dest)
             }),
         );
+    }
+
+    /// Attempt to accept an incoming connection on the listening socket in a
+    /// non-blocking manner.
+    fn try_non_block_accept(
+        &mut self,
+        socket: &FileDescriptionRef<Socket>,
+        address_ptr: Pointer,
+        address_len_ptr: Pointer,
+        is_client_sock_nonblock: bool,
+        dest: &MPlaceTy<'tcx>,
+    ) -> InterpResult<'tcx, Result<(), IoError>> {
+        let this = self.eval_context_mut();
+
+        let state = socket.state.borrow();
+        let SocketState::Listening(listener) = &*state else {
+            // We checked that the socket is in listening state before calling
+            // this function.
+            unreachable!()
+        };
+
+        let (stream, addr) = match listener.accept() {
+            Ok(peer) => peer,
+            Err(e) => return interp_ok(Err(IoError::HostError(e))),
+        };
+
+        let family = match addr {
+            SocketAddr::V4(_) => SocketFamily::IPv4,
+            SocketAddr::V6(_) => SocketFamily::IPv6,
+        };
+
+        if address_ptr != Pointer::null() {
+            // We only attempt a write if the address pointer is not a null pointer.
+            // If the address pointer is a null pointer the user isn't interested in the
+            // address and we don't need to write anything.
+            if let Err(e) =
+                this.write_socket_address(&addr, address_ptr, address_len_ptr, "accept4")?
+            {
+                return interp_ok(Err(e));
+            };
+        }
+
+        let fd = this.machine.fds.new_ref(Socket {
+            family,
+            state: RefCell::new(SocketState::Connected(stream)),
+            is_non_block: Cell::new(is_client_sock_nonblock),
+        });
+        let sockfd = this.machine.fds.insert(fd);
+
+        // We need to create the scalar using the destination size since
+        // `syscall(SYS_accept4, ...)` returns a long which doesn't match
+        // the int returned from the `accept`/`accept4` syscalls.
+        // See <https://man7.org/linux/man-pages/man2/syscall.2.html>.
+        this.write_scalar(Scalar::from_int(sockfd, dest.layout.size), dest).map(Ok)
     }
 
     /// Block the thread until the stream is connected or an error occurred.
@@ -1271,7 +1429,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // We received a "writable" event so `try_set_connected` is safe to call.
                 match state.try_set_connected() {
                     Ok(_) => this.write_scalar(Scalar::from_i32(0), &dest),
-                     Err(SocketIoError::NotReady) => {
+                     Err(SocketIoError::NotReady(_)) => {
                         // We need to block the thread again as the connection is still not yet ready.
                         drop(state);
                         this.block_for_connect(socket, dest);
@@ -1307,18 +1465,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             } |this, kind: UnblockKind| {
                 assert_eq!(kind, UnblockKind::Ready);
 
-                let mut state = socket.state.borrow_mut();
-                let SocketState::Connected(stream) = &mut*state else {
-                    // We ensured that the socket is connected before blocking.
-                    unreachable!()
-                };
-
-                // This is a *non-blocking* write.
-                let result = this.write_to_host(stream, length, buffer_ptr)?;
-                match result {
+                match this.try_non_block_send(&socket, buffer_ptr, length)? {
                     Err(IoError::HostError(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // We need to block the thread again as it would still block.
-                        drop(state);
                         this.block_for_send(socket, buffer_ptr, length, finish);
                         interp_ok(())
                     },
@@ -1326,6 +1474,59 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }),
         );
+    }
+
+    /// Attempt to send bytes into the connected socket in a non-blocking manner.
+    fn try_non_block_send(
+        &mut self,
+        socket: &FileDescriptionRef<Socket>,
+        buffer_ptr: Pointer,
+        length: usize,
+    ) -> InterpResult<'tcx, Result<usize, IoError>> {
+        let this = self.eval_context_mut();
+
+        let mut state = socket.state.borrow_mut();
+        let stream = match &mut *state {
+            SocketState::Connecting(stream) => stream,
+            SocketState::Connected(stream) => stream,
+            // We ensured that the socket is connecting or connected
+            // before calling this function.
+            _ => unreachable!(),
+        };
+
+        // We need to manually check for errors since the last operation.
+        // This is needed because for non-blocking sockets the errors are written
+        // into SO_ERROR.
+        if let Ok(Some(e)) = stream.take_error() {
+            // There was an error on the socket since the last operation.
+            return interp_ok(Err(IoError::HostError(e)));
+        }
+
+        // This is a *non-blocking* write.
+        let result = this.write_to_host(stream, length, buffer_ptr)?;
+        match result {
+            Ok(write_size) => {
+                if matches!(&*state, SocketState::Connecting(_)) {
+                    // The write succeeded which means we can now be sure that the
+                    // socket is connected and thus we can "upgrade" it to `Connected`.
+
+                    // Temporarily use dummy state to take ownership of the stream.
+                    let SocketState::Connecting(stream) =
+                        std::mem::replace(&mut *state, SocketState::Initial)
+                    else {
+                        unreachable!()
+                    };
+                    *state = SocketState::Connected(stream);
+                }
+                interp_ok(Ok(write_size))
+            }
+            Err(IoError::HostError(e)) if e.kind() == io::ErrorKind::NotConnected => {
+                // On Windows hosts, `send` can return WSAENOTCONN where EAGAIN or EWOULDBLOCK
+                // would be returned on UNIX-like systems. We thus remap this error to an EWOULDBLOCK.
+                interp_ok(Err(IoError::HostError(io::Error::from(io::ErrorKind::WouldBlock))))
+            }
+            result => interp_ok(result),
+        }
     }
 
     /// Block the thread until we can receive bytes from the connected socket
@@ -1354,24 +1555,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             } |this, kind: UnblockKind| {
                 assert_eq!(kind, UnblockKind::Ready);
 
-                let mut state = socket.state.borrow_mut();
-                let SocketState::Connected(stream) = &mut*state else {
-                    // We ensured that the socket is connected before blocking.
-                    unreachable!()
-                };
-
-                // This is a *non-blocking* read/peek.
-                let result = this.read_from_host(|buf| {
-                    if should_peek {
-                        stream.peek(buf)
-                    } else {
-                        stream.read(buf)
-                    }
-                }, length, buffer_ptr)?;
-                match result {
+                match this.try_non_block_recv(&socket, buffer_ptr, length, should_peek)? {
                     Err(IoError::HostError(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                         // We need to block the thread again as it would still block.
-                        drop(state);
                         this.block_for_recv(socket, buffer_ptr, length, should_peek, finish);
                         interp_ok(())
                     },
@@ -1379,6 +1565,67 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }),
         );
+    }
+
+    /// Attempt to receive bytes from the connected socket in a non-blocking manner.
+    fn try_non_block_recv(
+        &mut self,
+        socket: &FileDescriptionRef<Socket>,
+        buffer_ptr: Pointer,
+        length: usize,
+        should_peek: bool,
+    ) -> InterpResult<'tcx, Result<usize, IoError>> {
+        let this = self.eval_context_mut();
+
+        let mut state = socket.state.borrow_mut();
+        let stream = match &mut *state {
+            SocketState::Connecting(stream) => stream,
+            SocketState::Connected(stream) => stream,
+            // We ensured that the socket is connecting or connected
+            // before calling this function.
+            _ => unreachable!(),
+        };
+
+        // We need to manually check for errors since the last operation.
+        // This is needed because for non-blocking sockets the errors are written
+        // into SO_ERROR.
+        if let Ok(Some(e)) = stream.take_error() {
+            // There was an error on the socket since the last operation.
+            return interp_ok(Err(IoError::HostError(e)));
+        }
+
+        // This is a *non-blocking* read/peek.
+        let result = this.read_from_host(
+            |buf| {
+                if should_peek { stream.peek(buf) } else { stream.read(buf) }
+            },
+            length,
+            buffer_ptr,
+        )?;
+        match result {
+            Ok(read_size) => {
+                if matches!(&*state, SocketState::Connecting(_)) {
+                    // The receive succeeded which means we can now be sure that the
+                    // socket is connected and thus we can "upgrade" it to `Connected`.
+
+                    // Temporarily use dummy state to take ownership of the stream.
+                    let SocketState::Connecting(stream) =
+                        std::mem::replace(&mut *state, SocketState::Initial)
+                    else {
+                        unreachable!()
+                    };
+                    *state = SocketState::Connected(stream);
+                }
+                interp_ok(Ok(read_size))
+            }
+
+            Err(IoError::HostError(e)) if e.kind() == io::ErrorKind::NotConnected => {
+                // On Windows hosts, `recv` can return WSAENOTCONN where EAGAIN or EWOULDBLOCK
+                // would be returned on UNIX-like systems. We thus remap this error to an EWOULDBLOCK.
+                interp_ok(Err(IoError::HostError(io::Error::from(io::ErrorKind::WouldBlock))))
+            }
+            Err(e) => interp_ok(Err(e)),
+        }
     }
 }
 
