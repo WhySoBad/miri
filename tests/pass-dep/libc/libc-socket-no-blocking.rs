@@ -1,8 +1,9 @@
 //@only-target: linux android freebsd solaris illumos # Currently we only support targets which can create non-blocking sockets using the `socket` syscall.
 //@compile-flags: -Zmiri-disable-isolation
-//@revisions: unix_host windows_host
-//@[unix_host] ignore-host: windows
+//@revisions: windows_host apple_host other_unix_host
+//@[other_unix_host] ignore-host: windows apple
 //@[windows_host] only-host: windows
+//@[apple_host] only-host: apple
 
 #![feature(io_error_inprogress)]
 
@@ -31,15 +32,12 @@ fn main() {
 /// `accept4` syscall is called.
 fn test_accept_nonblock() {
     // Create a new non-blocking server socket.
-    let (server_sockfd, addr) =
-        net::ipv4_listener(net::IPV4_LOCALHOST, libc::SOCK_NONBLOCK).unwrap();
+    let (server_sockfd, addr) = net::make_listener_ipv4(libc::SOCK_NONBLOCK).unwrap();
     let client_sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
 
     // This should fail as we don't have an incoming connection for this address.
-    let err = net::sockname(|storage, len| unsafe { libc::accept(server_sockfd, storage, len) })
-        .err()
-        .unwrap();
+    let err = net::accept_ipv4(server_sockfd).unwrap_err();
     // Assert that either EAGAIN or EWOULDBLOCK was returned.
     assert_eq!(err.kind(), ErrorKind::WouldBlock);
 
@@ -48,25 +46,17 @@ fn test_accept_nonblock() {
         // was called before we call the `accept` on the server.
         thread::sleep(Duration::from_millis(10));
 
-        let (_peerfd, _peer_addr) =
-            net::sockname(|storage, len| unsafe { libc::accept(server_sockfd, storage, len) })
-                .unwrap();
+        net::accept_ipv4(server_sockfd).unwrap();
     });
 
-    unsafe {
-        errno_check(libc::connect(
-            client_sockfd,
-            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ));
-    }
+    net::connect_ipv4(client_sockfd, addr);
 
     t1.join().unwrap();
 }
 
 /// Test sending bytes into and receiving bytes from a connected stream without blocking.
 fn test_send_recv_nonblock() {
-    let (server_sockfd, addr) = net::ipv4_listener(net::IPV4_LOCALHOST, 0).unwrap();
+    let (server_sockfd, addr) = net::make_listener_ipv4(0).unwrap();
     // Create a new non-blocking client socket.
     let client_sockfd = unsafe {
         errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0))
@@ -75,9 +65,7 @@ fn test_send_recv_nonblock() {
 
     // Spawn the server thread.
     let server_thread = thread::spawn(move || {
-        let (peerfd, _peer_addr) =
-            net::sockname(|storage, len| unsafe { libc::accept(server_sockfd, storage, len) })
-                .unwrap();
+        let (peerfd, _) = net::accept_ipv4(server_sockfd).unwrap();
 
         // Yield back to client to test that attempting to receive from a socket
         // which has an empty buffer would block.
@@ -113,7 +101,7 @@ fn test_send_recv_nonblock() {
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
 
-        if cfg!(unix_host) {
+        if cfg!(any(other_unix_host, apple_host)) {
             // We can only test whether non-blocking writes would block once the buffer is full
             // on UNIX hosts.
 
@@ -199,7 +187,7 @@ fn test_send_recv_nonblock() {
     };
     assert_eq!(bytes_written as usize, TEST_BYTES.len());
 
-    if cfg!(unix_host) {
+    if cfg!(any(apple_host, other_unix_host)) {
         // We can only test filling the buffer on UNIX because on
         // Windows the receive buffer of a localhost socket dynamically
         // grows.
@@ -223,7 +211,7 @@ fn test_send_recv_nonblock() {
 
 /// Test writing bytes into and reading bytes from a connected stream without blocking.
 fn test_write_read_nonblock() {
-    let (server_sockfd, addr) = net::ipv4_listener(net::IPV4_LOCALHOST, 0).unwrap();
+    let (server_sockfd, addr) = net::make_listener_ipv4(0).unwrap();
     // Create a new non-blocking client socket.
     let client_sockfd = unsafe {
         errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0))
@@ -232,9 +220,7 @@ fn test_write_read_nonblock() {
 
     // Spawn the server thread.
     let server_thread = thread::spawn(move || {
-        let (peerfd, _peer_addr) =
-            net::sockname(|storage, len| unsafe { libc::accept(server_sockfd, storage, len) })
-                .unwrap();
+        let (peerfd, _) = net::accept_ipv4(server_sockfd).unwrap();
 
         // Yield back to client to test that attempting to read from a socket
         // which has an empty buffer would block.
@@ -264,7 +250,7 @@ fn test_write_read_nonblock() {
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
 
-        if cfg!(unix_host) {
+        if cfg!(any(other_unix_host, apple_host)) {
             // We can only test whether non-blocking writes would block once the buffer is full
             // on UNIX hosts.
 
@@ -338,7 +324,7 @@ fn test_write_read_nonblock() {
     };
     assert_eq!(bytes_written as usize, TEST_BYTES.len());
 
-    if cfg!(unix_host) {
+    if cfg!(any(other_unix_host, apple_host)) {
         // We can only test filling the buffer on UNIX because on
         // Windows the receive buffer of a localhost socket dynamically
         // grows.
@@ -372,7 +358,7 @@ fn test_getpeername_ipv4_nonblock() {
 
     // Blackhole address where the socket stays in connecting state but never
     // successfully connects.
-    let blackhole_addr = net::ipv4_sock_addr([192, 0, 2, 1], 0);
+    let blackhole_addr = net::sock_addr_ipv4([192, 0, 2, 1], 0);
 
     let err = unsafe {
         errno_result(libc::connect(
@@ -394,22 +380,28 @@ fn test_getpeername_ipv4_nonblock() {
             // test since the subsequent statements
             // rely on the assumption that the socket is
             // still not successfully connected.
+            assert!(
+                cfg!(any(windows_host, apple_host)),
+                "only Windows and Apple hosts ignore blackhole IP addresses"
+            );
             return;
         }
         // All other errors should not happen.
         _ => panic!(),
     }
 
+    assert!(cfg!(other_unix_host), "blackhole IP addresses only work on non-apple UNIX hosts");
+
     // Since we're connecting to a blackhole IP address, the socket should never be
     // successfully connected and thus we should be unable to read the peername.
-    let Err(err) =
-        net::sockname(|storage, len| unsafe { libc::getpeername(client_sockfd, storage, len) })
-    else {
+    let Err(err) = net::sockname_ipv4(|storage, len| unsafe {
+        libc::getpeername(client_sockfd, storage, len)
+    }) else {
         unreachable!()
     };
     assert_eq!(err.kind(), ErrorKind::NotConnected);
 
-    let (server_sockfd, addr) = net::ipv4_listener(net::IPV4_LOCALHOST, 0).unwrap();
+    let (server_sockfd, addr) = net::make_listener_ipv4(0).unwrap();
     // Create a new non-blocking client socket.
     let client_sockfd = unsafe {
         errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0))
@@ -418,9 +410,7 @@ fn test_getpeername_ipv4_nonblock() {
 
     // Spawn the server thread.
     let server_thread = thread::spawn(move || {
-        let (_peerfd, _peer_addr) =
-            net::sockname(|storage, len| unsafe { libc::accept(server_sockfd, storage, len) })
-                .unwrap();
+        net::accept_ipv4(server_sockfd).unwrap();
     });
 
     // Yield to server thread to ensure that it's currently accepting.
@@ -441,15 +431,10 @@ fn test_getpeername_ipv4_nonblock() {
     // within 20ms.
     thread::sleep(Duration::from_millis(20));
 
-    let (_, peer_addr) =
-        net::sockname(|storage, len| unsafe { libc::getpeername(client_sockfd, storage, len) })
-            .unwrap();
-
-    let net::LibcSocketAddr::V4(peer_addr) = peer_addr else {
-        // We connected to an IPv4 address so we also expect
-        // an IPv4 address to be returned.
-        panic!()
-    };
+    let (_, peer_addr) = net::sockname_ipv4(|storage, len| unsafe {
+        libc::getpeername(client_sockfd, storage, len)
+    })
+    .unwrap();
 
     assert_eq!(addr.sin_family, peer_addr.sin_family);
     assert_eq!(addr.sin_port, peer_addr.sin_port);

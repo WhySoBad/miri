@@ -522,8 +522,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // Mio returns a potentially unconnected stream.
         // We can be ensured that the connection is established when
-        // [`TcpStream::take_err`] doesn't return an error after
-        // receiving an [`Interest::WRITEABLE`] event on the stream.
+        // [`TcpStream::take_err`] and [`TcpStream::peer_addr`] both
+        // don't return an error after receiving an [`Interest::WRITEABLE`]
+        // event on the stream.
         match TcpStream::connect(address) {
             Ok(stream) => *socket.state.borrow_mut() = SocketState::Connecting(stream),
             Err(e) => return this.set_last_error_and_return(e, dest),
@@ -767,6 +768,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         }
 
+        // If either the operation or the socket is non-blocking, we don't want
+        // to wait until the connection is established.
         let should_wait = !(is_op_non_block || socket.is_non_block.get());
         let dest = dest.clone();
 
@@ -970,9 +973,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let dest = dest.clone();
 
-        // On Windows hosts, for the reason explained in [`SocketState::try_set_connected`], we need
-        // to ensure that the connection is established before "trusting" the output of [`TcpStream::peer_addr`].
-        // This is not necessary for UNIX hosts but it also works, so we use the same code for all hosts.
+        // It's only safe to call [`TcpStream::peer_addr`] after receiving an [`Interest::WRITEABLE`]
+        // event because Windows also returns a peer address when the socket is not yet connected.
+        // That's why we need to ensure that we only call [`TcpStream::peer_addr`] after being connected.
         this.ensure_connected(
             socket.clone(),
             /* should_wait */ false,
@@ -1437,13 +1440,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Result<usize, IoError>> {
         let this = self.eval_context_mut();
 
-        let mut state = socket.state.borrow_mut();
-        let stream = match &mut *state {
-            SocketState::Connecting(stream) => stream,
-            SocketState::Connected(stream) => stream,
-            // We ensured that the socket is connecting or connected
-            // before calling this function.
-            _ => unreachable!(),
+        let SocketState::Connected(stream) = &mut *socket.state.borrow_mut() else {
+            // We ensured that the socket is connected before calling this function.
+            unreachable!()
         };
 
         // This is a *non-blocking* write.
@@ -1512,13 +1511,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Result<usize, IoError>> {
         let this = self.eval_context_mut();
 
-        let mut state = socket.state.borrow_mut();
-        let stream = match &mut *state {
-            SocketState::Connecting(stream) => stream,
-            SocketState::Connected(stream) => stream,
-            // We ensured that the socket is connecting or connected
-            // before calling this function.
-            _ => unreachable!(),
+        let SocketState::Connected(stream) = &mut *socket.state.borrow_mut() else {
+            // We ensured that the socket is connected before calling this function.
+            unreachable!()
         };
 
         // We need to manually check for errors since the last operation.
