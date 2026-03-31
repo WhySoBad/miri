@@ -1294,7 +1294,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// This recursively calls itself should the operation still block for some reason.
     ///
     /// **Note**: This function is only safe to call when having previously ensured
-    /// that the socket is in [`SocketState::Accepting`].
+    /// that the socket is in [`SocketState::Listening`].
     fn block_for_accept(
         &mut self,
         socket: FileDescriptionRef<Socket>,
@@ -1340,7 +1340,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// non-blocking manner.
     ///
     /// **Note**: This function is only safe to call when having previously ensured
-    /// that the socket is in [`SocketState::Accepting`].
+    /// that the socket is in [`SocketState::Listening`].
     fn try_non_block_accept(
         &mut self,
         socket: &FileDescriptionRef<Socket>,
