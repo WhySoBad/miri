@@ -1551,9 +1551,11 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     // [`SocketState::Connected`] or an error occurred.
     /// If the socket is currently neither in the [`SocketState::Connecting`] nor
     /// the [`SocketState::Connecting`] state, an ENOTCONN error is returned.
+    /// When the callback function is called with `Ok(_)`, then we're guaranteed
+    /// that the socket is in the [`SocketState::Connected`] state.
     ///
-    /// Optionally, block until either an error occurred or the socket
-    /// reached the [`SocketState::Connected`].
+    /// This function can optionally also block until either an error occurred or
+    /// the socket reached the [`SocketState::Connected`] state.
     fn ensure_connected(
         &mut self,
         socket: FileDescriptionRef<Socket>,
@@ -1579,7 +1581,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // We're currently connecting.
 
-        // If we should block, the timeout is `None`. Otherwise, it's a zero duration timeout.
+        // If we should wait until the connection is established, the timeout is `None`.
+        // Otherwise, it's a zero duration timeout.
         let timeout = should_wait.not().then_some((
             TimeoutClock::Monotonic,
             TimeoutAnchor::Absolute,
@@ -1597,17 +1600,31 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     action: DynMachineCallback<'tcx, Result<(), IoError>>,
                 } |this, kind: UnblockKind| {
                     if let UnblockKind::TimedOut = kind {
-                        // We can only time out when `should_wait` is true.
+                        // We can only time out when `should_wait` is false.
                         // This then means that the socket is not yet connected.
                         this.machine.blocking_io.deregister(this.active_thread());
+                        return action.call(this, Err(LibcError("ENOTCONN")))
                     }
 
                     // The thread woke up because it's ready.
 
                     let mut state = socket.state.borrow_mut();
-                    let SocketState::Connecting(stream) = &*state else {
-                        // We ensured that we only block when we're currently connecting.
-                        unreachable!();
+                    let stream = match &*state {
+                        SocketState::Connecting(stream) => stream,
+                        SocketState::Connected(_) => {
+                            drop(state);
+                            // Since this thread just got rescheduled, it could be that
+                            // another thread "upgraded" the connection in the meantime.
+                            return action.call(this, Ok(()))
+                        },
+                        _ => {
+                            drop(state);
+                            // We ensured that we only block when we're currently connecting.
+                            // Since this thread just got rescheduled, it could be that another
+                            // thread realized that the connection failed and we're thus in
+                            // an "invalid state".
+                            return action.call(this, Err(LibcError("ENOTCONN")))
+                        }
                     };
 
                     // Manually check whether there were any errors since calling `connect`.
@@ -1616,18 +1633,36 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         // return ENOTCONN. It's the program's responsibility
                         // to read SO_ERROR itself.
                         //
-                        // Go back to initial state as the only way of getting into the
-                        // `Connecting` state is from the `Initial` state.
+                        // Go back to initial state since the only way of getting into the
+                        // `Connecting` state is from the `Initial` state and at this point
+                        // we know that the connection won't be established anymore.
                         *state = SocketState::Initial;
                         drop(state);
                         return action.call(this, Err(LibcError("ENOTCONN")))
                     }
 
-                    // There was no error during connecting.
-                    // Mio suggests calling `peer_addr` after checking for errors but since there doesn't
-                    // seem to be a reason for this (tokio doesn't do it either) we won't do it here:
-                    // <https://github.com/tokio-rs/mio/issues/1942>
-                    //
+                    // There was no error during connecting. We still need to ensure that
+                    // the wakeup wasn't a spurious wakeup. We do this by attempting to
+                    // read the peer address of the socket.
+
+                    match stream.peer_addr() {
+                        Ok(_) => { /* fall-through to below */},
+                        Err(e) if should_wait && (e.kind() == io::ErrorKind::NotConnected || e.kind() == io::ErrorKind::InProgress) => {
+                            // We received a spurious wake-up from the OS. We block again until we
+                            // get a real wake-up event.
+                            drop(state);
+                            return this.ensure_connected(socket, should_wait, action)
+                        },
+                        Err(_) => {
+                            // Getting the peer address should only fail for system errors (e.g. ENOBUFS or
+                            // WSAENETDOWN) when the socket is connected successfully. Since most socket syscalls
+                            // don't have those specific errors, it's better to panic in this case
+                            // rather than returning it for a syscall for which it doesn't exist.
+                            panic!()
+                        }
+                    }
+
+                    // We were able to read the peer address.
                     // This means that the connection is now established.
 
                     // Temporarily use dummy state to take ownership of the stream.
