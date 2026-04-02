@@ -155,22 +155,33 @@ fn test_send_recv_nonblock() {
     };
     assert_eq!(err.kind(), ErrorKind::WouldBlock);
 
-    // Yield to server thread to send some bytes into the peer socket.
-    thread::sleep(Duration::from_millis(250));
+    // Try to receive bytes from the peer socket without blocking.
+    // Since the peer socket might do partial writes, we might need to
+    // sleep multiple times until we received everything.
 
-    // Receiving bytes from the peer socket without blocking should now
-    // succeed as the peer socket is writing.
-    let bytes_read = unsafe {
-        errno_result(libc_utils::net::recv_all(
-            client_sockfd,
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            0,
-        ))
-        .unwrap()
-    };
+    let mut bytes_read = 0usize;
+    while bytes_read != TEST_BYTES.len() {
+        let read_result = unsafe {
+            errno_result(libc_utils::net::recv_all(
+                client_sockfd,
+                buffer.as_mut_ptr().byte_add(bytes_read).cast(),
+                buffer.len() - bytes_read,
+                0,
+            ))
+        };
 
-    assert_eq!(bytes_read as usize, TEST_BYTES.len());
+        match read_result {
+            Ok(read) => bytes_read += read as usize,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                // No data to read; Yield to peer to write more bytes into the buffer.
+                thread::sleep(Duration::from_millis(50))
+            }
+            Err(err) => {
+                panic!("error whilst receiving bytes: {err}")
+            }
+        }
+    }
+
     assert_eq!(&buffer, TEST_BYTES);
 
     // Now we test non-blocking writing.
@@ -298,17 +309,32 @@ fn test_write_read_nonblock() {
     };
     assert_eq!(err.kind(), ErrorKind::WouldBlock);
 
-    // Yield to server thread to write some bytes into the peer socket.
-    thread::sleep(Duration::from_millis(250));
+    // Try to read bytes from the peer socket without blocking.
+    // Since the peer socket might do partial writes, we might need to
+    // sleep multiple times until we read everything.
 
-    // Reading bytes from the peer socket without blocking should now
-    // succeed as the peer socket is writing.
-    let bytes_read = unsafe {
-        errno_result(libc_utils::read_all(client_sockfd, buffer.as_mut_ptr().cast(), buffer.len()))
-            .unwrap()
-    };
+    let mut bytes_read = 0usize;
+    while bytes_read != TEST_BYTES.len() {
+        let read_result = unsafe {
+            errno_result(libc_utils::read_all(
+                client_sockfd,
+                buffer.as_mut_ptr().byte_add(bytes_read).cast(),
+                buffer.len() - bytes_read,
+            ))
+        };
 
-    assert_eq!(bytes_read as usize, TEST_BYTES.len());
+        match read_result {
+            Ok(read) => bytes_read += read as usize,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                // No data to read; Yield to peer to write more bytes into the buffer.
+                thread::sleep(Duration::from_millis(50))
+            }
+            Err(err) => {
+                panic!("error whilst reading bytes: {err}")
+            }
+        }
+    }
+
     assert_eq!(&buffer, TEST_BYTES);
 
     // Now we test non-blocking writing.
