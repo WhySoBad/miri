@@ -21,6 +21,14 @@ const TEST_BYTES: &[u8] = b"these are some test bytes!";
 fn main() {
     test_accept_nonblock();
     test_send_recv_nonblock();
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    test_send_recv_dontwait();
     test_write_read_nonblock();
 
     test_getpeername_ipv4_nonblock();
@@ -184,7 +192,7 @@ fn test_send_recv_nonblock() {
 
     assert_eq!(&buffer, TEST_BYTES);
 
-    // Now we test non-blocking writing.
+    // Test non-blocking writing.
 
     // Sending into the empty buffer should succeed without blocking.
     let bytes_written = unsafe {
@@ -211,6 +219,166 @@ fn test_send_recv_nonblock() {
                 fill_buf.as_ptr().cast(),
                 fill_buf.len(),
                 0,
+            ))
+            .unwrap_err()
+        };
+        assert_eq!(err.kind(), ErrorKind::WouldBlock)
+    }
+
+    server_thread.join().unwrap();
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+/// Test sending bytes into and receiving bytes from a connected stream without blocking.
+/// Instead of using non-blocking sockets, we test whether it works with blocking sockets
+/// when passing the `libc::MSG_DONTWAIT` flag to the send and receive calls.
+fn test_send_recv_dontwait() {
+    let (server_sockfd, addr) = net::make_listener_ipv4(0).unwrap();
+    let client_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    // Spawn the server thread.
+    let server_thread = thread::spawn(move || {
+        let (peerfd, _) = net::accept_ipv4(server_sockfd).unwrap();
+
+        // Yield back to client to test that attempting to receive from a socket
+        // which has an empty buffer would block.
+        thread::sleep(Duration::from_millis(10));
+
+        let bytes_written = unsafe {
+            errno_result(libc_utils::net::send_all(
+                peerfd,
+                TEST_BYTES.as_ptr().cast(),
+                TEST_BYTES.len(),
+                0,
+            ))
+            .unwrap()
+        };
+        assert_eq!(bytes_written as usize, TEST_BYTES.len());
+
+        // Yield back to the client thread which now attempts to read
+        // and then to fill the receive buffer of the peerfd socket.
+        thread::sleep(Duration::from_millis(10));
+
+        // The buffer should contain `TEST_BYTES` at the beginning.
+        let mut buffer = [0; TEST_BYTES.len()];
+        let bytes_read = unsafe {
+            errno_result(libc_utils::net::recv_all(
+                peerfd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            ))
+            .unwrap()
+        };
+
+        assert_eq!(bytes_read as usize, TEST_BYTES.len());
+        assert_eq!(&buffer, TEST_BYTES);
+
+        if cfg!(any(other_unix_host, apple_host)) {
+            // We can only test whether non-blocking writes would block once the buffer is full
+            // on UNIX hosts.
+
+            // After the `TEST_BYTES` the buffer should only contain ones.
+            // We exemplary test that some bytes were written, but since we don't know the
+            // exact buffer size (or how many bytes were exactly written before the EWOULDBLOCK)
+            // we can't read the whole buffer.
+            let mut buffer = [0; 1000];
+            let bytes_read = unsafe {
+                errno_result(libc_utils::net::recv_all(
+                    peerfd,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    0,
+                ))
+                .unwrap()
+            };
+
+            assert_eq!(bytes_read as usize, buffer.len());
+            assert_eq!(&buffer, &[1u8; 1000]);
+        }
+    });
+
+    net::connect_ipv4(client_sockfd, addr);
+
+    // We are connected and the server socket is not writing.
+
+    let mut buffer = [0; TEST_BYTES.len()];
+    // Receiving from a socket when the peer is not writing is
+    // not possible without blocking.
+    let err = unsafe {
+        errno_result(libc_utils::net::recv_all(
+            client_sockfd,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_DONTWAIT,
+        ))
+        .unwrap_err()
+    };
+    assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+    // Try to receive bytes from the peer socket without blocking.
+    // Since the peer socket might do partial writes, we might need to
+    // sleep multiple times until we received everything.
+
+    let mut bytes_read = 0usize;
+    while bytes_read != TEST_BYTES.len() {
+        let read_result = unsafe {
+            errno_result(libc_utils::net::recv_all(
+                client_sockfd,
+                buffer.as_mut_ptr().byte_add(bytes_read).cast(),
+                buffer.len() - bytes_read,
+                libc::MSG_DONTWAIT,
+            ))
+        };
+
+        match read_result {
+            Ok(read) => bytes_read += read as usize,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                // No data to read; Yield to peer to write more bytes into the buffer.
+                thread::sleep(Duration::from_millis(50))
+            }
+            Err(err) => {
+                panic!("error whilst receiving bytes: {err}")
+            }
+        }
+    }
+
+    assert_eq!(&buffer, TEST_BYTES);
+
+    // Test non-blocking writing.
+
+    // Sending into the empty buffer should succeed without blocking.
+    let bytes_written = unsafe {
+        errno_result(libc_utils::net::send_all(
+            client_sockfd,
+            TEST_BYTES.as_ptr().cast(),
+            TEST_BYTES.len(),
+            libc::MSG_DONTWAIT,
+        ))
+        .unwrap()
+    };
+    assert_eq!(bytes_written as usize, TEST_BYTES.len());
+
+    if cfg!(any(apple_host, other_unix_host)) {
+        // We can only test filling the buffer on UNIX because on
+        // Windows the receive buffer of a localhost socket dynamically
+        // grows.
+
+        let fill_buf = [1u8; 5_000_000];
+        // This fills the socket receive buffer and thus should start blocking.
+        let err = unsafe {
+            errno_result(libc_utils::net::send_all(
+                client_sockfd,
+                fill_buf.as_ptr().cast(),
+                fill_buf.len(),
+                libc::MSG_DONTWAIT,
             ))
             .unwrap_err()
         };
