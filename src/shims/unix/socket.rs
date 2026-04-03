@@ -89,6 +89,7 @@ impl FileDescription for Socket {
         ecx.ensure_connected(
             socket.clone(),
             !socket.is_non_block.get(),
+            "read",
             callback!(
                 @capture<'tcx> {
                     socket: FileDescriptionRef<Socket>,
@@ -134,6 +135,7 @@ impl FileDescription for Socket {
         ecx.ensure_connected(
             socket.clone(),
             !socket.is_non_block.get(),
+            "write",
             callback!(
                 @capture<'tcx> {
                     socket: FileDescriptionRef<Socket>,
@@ -548,6 +550,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.ensure_connected(
             socket,
             true,
+            "connect",
             callback!(
                 @capture<'tcx> {
                     dest: MPlaceTy<'tcx>
@@ -628,7 +631,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         if flags != 0 {
             throw_unsup_format!(
-                "send: flag {flags:#x} is unsupported, only MSG_NOSIGNAL and MSG_DONTBLOCK are allowed",
+                "send: flag {flags:#x} is unsupported, only MSG_NOSIGNAL and MSG_DONTWAIT are allowed",
             );
         }
 
@@ -640,6 +643,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.ensure_connected(
             socket.clone(),
             should_wait,
+            "send",
             callback!(
                 @capture<'tcx> {
                     socket: FileDescriptionRef<Socket>,
@@ -776,6 +780,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.ensure_connected(
             socket.clone(),
             should_wait,
+            "recv",
             callback!(
                 @capture<'tcx> {
                     socket: FileDescriptionRef<Socket>,
@@ -979,6 +984,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.ensure_connected(
             socket.clone(),
             /* should_wait */ false,
+            "getpeername",
             callback!(
                 @capture<'tcx> {
                     socket: FileDescriptionRef<Socket>,
@@ -1555,6 +1561,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         socket: FileDescriptionRef<Socket>,
         should_wait: bool,
+        foreign_name: &'static str,
         action: DynMachineCallback<'tcx, Result<(), IoError>>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
@@ -1592,6 +1599,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 @capture<'tcx> {
                     socket: FileDescriptionRef<Socket>,
                     should_wait: bool,
+                    foreign_name: &'static str,
                     action: DynMachineCallback<'tcx, Result<(), IoError>>,
                 } |this, kind: UnblockKind| {
                     if let UnblockKind::TimedOut = kind {
@@ -1643,10 +1651,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     match stream.peer_addr() {
                         Ok(_) => { /* fall-through to below */},
                         Err(e) if should_wait && (e.kind() == io::ErrorKind::NotConnected || e.kind() == io::ErrorKind::InProgress) => {
-                            // We received a spurious wake-up from the OS. We block again until we
-                            // get a real wake-up event.
-                            drop(state);
-                            return this.ensure_connected(socket, should_wait, action)
+                            // We received a spurious wake-up from the OS. This should be considered an OS bug:
+                            // <https://github.com/tokio-rs/mio/issues/1942#issuecomment-4169378308>
+                            panic!("{foreign_name}: received writeable event from OS but socket is not yet connected")
                         },
                         Err(_) => {
                             // Getting the peer address should only fail for system errors (e.g. ENOBUFS or
