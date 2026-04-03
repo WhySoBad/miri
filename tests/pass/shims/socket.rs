@@ -2,7 +2,7 @@
 //@compile-flags: -Zmiri-disable-isolation
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::thread;
 
 const TEST_BYTES: &[u8] = b"these are some test bytes!";
@@ -14,6 +14,7 @@ fn main() {
     test_read_write();
     test_peek();
     test_peer_addr();
+    test_addr_resolution();
 }
 
 fn test_create_ipv4_listener() {
@@ -112,4 +113,14 @@ fn test_peer_addr() {
     assert_eq!(address, peer_addr);
 
     handle.join().unwrap();
+}
+
+/// Test that address names get resolved to IP addresses.
+fn test_addr_resolution() {
+    let listener = TcpListener::bind("localhost:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    match address.ip() {
+        IpAddr::V4(addr) => assert_eq!(addr, Ipv4Addr::LOCALHOST),
+        IpAddr::V6(addr) => assert_eq!(addr, Ipv6Addr::LOCALHOST),
+    }
 }
