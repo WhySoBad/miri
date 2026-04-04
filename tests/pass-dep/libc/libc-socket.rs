@@ -211,7 +211,7 @@ fn test_accept_connect() {
     thread::sleep(Duration::from_millis(10));
 
     // Test connecting to an already accepting server.
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     // Server thread should now be in its `sleep`.
     // Test connecting when there is no actively ongoing `accept`.
@@ -219,7 +219,7 @@ fn test_accept_connect() {
     let client_sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
 
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     server_thread.join().unwrap();
 }
@@ -250,7 +250,7 @@ fn test_send_peek_recv() {
         assert_eq!(bytes_written as usize, TEST_BYTES.len());
     });
 
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     let mut buffer = [0; TEST_BYTES.len()];
     let bytes_read = unsafe {
@@ -311,7 +311,7 @@ fn test_partial_send_recv() {
         });
     });
 
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     // Ensure we sometimes do incomplete writes.
     check_nondet(|| {
@@ -357,7 +357,7 @@ fn test_write_read() {
         assert_eq!(bytes_written as usize, TEST_BYTES.len());
     });
 
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     let mut buffer = [0; TEST_BYTES.len()];
     let bytes_read = unsafe {
@@ -489,7 +489,7 @@ fn test_getpeername_ipv4() {
     // Spawn the server thread.
     let server_thread = thread::spawn(move || net::accept_ipv4(server_sockfd).unwrap());
 
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     let (_, peer_addr) = net::sockname_ipv4(|storage, len| unsafe {
         libc::getpeername(client_sockfd, storage, len)
@@ -514,7 +514,7 @@ fn test_getpeername_ipv6() {
     // Spawn the server thread.
     let server_thread = thread::spawn(move || net::accept_ipv6(server_sockfd).unwrap());
 
-    net::connect_ipv6(client_sockfd, addr);
+    net::connect_ipv6(client_sockfd, addr).unwrap();
 
     let (_, peer_addr) = net::sockname_ipv6(|storage, len| unsafe {
         libc::getpeername(client_sockfd, storage, len)

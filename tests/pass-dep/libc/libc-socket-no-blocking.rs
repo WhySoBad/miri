@@ -21,13 +21,6 @@ const TEST_BYTES: &[u8] = b"these are some test bytes!";
 fn main() {
     test_accept_nonblock();
     test_send_recv_nonblock();
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "solaris",
-        target_os = "illumos"
-    ))]
     test_send_recv_dontwait();
     test_write_read_nonblock();
 
@@ -57,7 +50,7 @@ fn test_accept_nonblock() {
         net::accept_ipv4(server_sockfd).unwrap();
     });
 
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     t1.join().unwrap();
 }
@@ -137,14 +130,7 @@ fn test_send_recv_nonblock() {
     thread::sleep(Duration::from_millis(10));
 
     // Non-blocking connects always "fail" with EINPROGRESS.
-    let err = unsafe {
-        errno_result(libc::connect(
-            client_sockfd,
-            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ))
-        .unwrap_err()
-    };
+    let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InProgress);
 
     // We are connecting and the server socket is not writing.
@@ -228,13 +214,6 @@ fn test_send_recv_nonblock() {
     server_thread.join().unwrap();
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "solaris",
-    target_os = "illumos"
-))]
 /// Test sending bytes into and receiving bytes from a connected stream without blocking.
 /// Instead of using non-blocking sockets, we test whether it works with blocking sockets
 /// when passing the `libc::MSG_DONTWAIT` flag to the send and receive calls.
@@ -305,7 +284,7 @@ fn test_send_recv_dontwait() {
         }
     });
 
-    net::connect_ipv4(client_sockfd, addr);
+    net::connect_ipv4(client_sockfd, addr).unwrap();
 
     // We are connected and the server socket is not writing.
 
@@ -452,14 +431,7 @@ fn test_write_read_nonblock() {
     thread::sleep(Duration::from_millis(10));
 
     // Non-blocking connects always "fail" with EINPROGRESS.
-    let err = unsafe {
-        errno_result(libc::connect(
-            client_sockfd,
-            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ))
-        .unwrap_err()
-    };
+    let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InProgress);
 
     // We are connecting and the server socket is not writing.
@@ -551,17 +523,11 @@ fn test_getpeername_ipv4_nonblock() {
     };
 
     // Blackhole address where the socket stays in connecting state but never
-    // successfully connects.
+    // successfully connects:
+    // <https://www.rfc-editor.org/rfc/rfc5737>
     let blackhole_addr = net::sock_addr_ipv4([192, 0, 2, 1], 0);
 
-    let err = unsafe {
-        errno_result(libc::connect(
-            client_sockfd,
-            (&blackhole_addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ))
-        .unwrap_err()
-    };
+    let err = net::connect_ipv4(client_sockfd, blackhole_addr).unwrap_err();
 
     // Non-blocking connect should fail with EINPROGRESS.
     match err.kind() {

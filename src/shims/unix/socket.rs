@@ -637,7 +637,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // If either the operation or the socket is non-blocking, we don't want
         // to wait until the connection is established.
-        let should_wait = !(is_op_non_block || socket.is_non_block.get());
+        let should_wait = !is_op_non_block && !socket.is_non_block.get();
         let dest = dest.clone();
 
         this.ensure_connected(
@@ -774,7 +774,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // If either the operation or the socket is non-blocking, we don't want
         // to wait until the connection is established.
-        let should_wait = !(is_op_non_block || socket.is_non_block.get());
+        let should_wait = !is_op_non_block && !socket.is_non_block.get();
         let dest = dest.clone();
 
         this.ensure_connected(
@@ -978,9 +978,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let dest = dest.clone();
 
-        // It's only safe to call [`TcpStream::peer_addr`] after receiving an [`Interest::WRITEABLE`]
-        // event because Windows also returns a peer address when the socket is not yet connected.
-        // That's why we need to ensure that we only call [`TcpStream::peer_addr`] after being connected.
+        // It's only safe to call [`TcpStream::peer_addr`] after the socket is connected since
+        // UNIX targets should return ENOTCONN when the connection is not yet established.
         this.ensure_connected(
             socket.clone(),
             /* should_wait */ false,
@@ -1361,9 +1360,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let state = socket.state.borrow();
         let SocketState::Listening(listener) = &*state else {
-            // We checked that the socket is in listening state before calling
-            // this function.
-            unreachable!()
+            panic!(
+                "try_non_block_accept must only be called when socket is in `SocketState::Listening`"
+            )
         };
 
         let (stream, addr) = match listener.accept() {
@@ -1447,8 +1446,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         let SocketState::Connected(stream) = &mut *socket.state.borrow_mut() else {
-            // We ensured that the socket is connected before calling this function.
-            unreachable!()
+            panic!(
+                "try_non_block_send must only be called when socket is in `SocketState::Connected`"
+            )
         };
 
         // This is a *non-blocking* write.
@@ -1457,7 +1457,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             Err(IoError::HostError(e)) if e.kind() == io::ErrorKind::NotConnected => {
                 // On Windows hosts, `send` can return WSAENOTCONN where EAGAIN or EWOULDBLOCK
                 // would be returned on UNIX-like systems. We thus remap this error to an EWOULDBLOCK.
-                interp_ok(Err(IoError::HostError(io::Error::from(io::ErrorKind::WouldBlock))))
+                interp_ok(Err(IoError::HostError(io::ErrorKind::WouldBlock.into())))
             }
             result => interp_ok(result),
         }
@@ -1518,17 +1518,10 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         let SocketState::Connected(stream) = &mut *socket.state.borrow_mut() else {
-            // We ensured that the socket is connected before calling this function.
-            unreachable!()
+            panic!(
+                "try_non_block_recv must only be called when socket is in `SocketState::Connected`"
+            )
         };
-
-        // We need to manually check for errors since the last operation.
-        // This is needed because for non-blocking sockets the errors are written
-        // into SO_ERROR.
-        if let Ok(Some(e)) = stream.take_error() {
-            // There was an error on the socket since the last operation.
-            return interp_ok(Err(IoError::HostError(e)));
-        }
 
         // This is a *non-blocking* read/peek.
         let result = this.read_from_host(
@@ -1542,7 +1535,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             Err(IoError::HostError(e)) if e.kind() == io::ErrorKind::NotConnected => {
                 // On Windows hosts, `recv` can return WSAENOTCONN where EAGAIN or EWOULDBLOCK
                 // would be returned on UNIX-like systems. We thus remap this error to an EWOULDBLOCK.
-                interp_ok(Err(IoError::HostError(io::Error::from(io::ErrorKind::WouldBlock))))
+                interp_ok(Err(IoError::HostError(io::ErrorKind::WouldBlock.into())))
             }
             result => interp_ok(result),
         }
@@ -1605,11 +1598,12 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     if let UnblockKind::TimedOut = kind {
                         // We can only time out when `should_wait` is false.
                         // This then means that the socket is not yet connected.
+                        assert!(!should_wait);
                         this.machine.blocking_io.deregister(this.active_thread());
                         return action.call(this, Err(LibcError("ENOTCONN")))
                     }
 
-                    // The thread woke up because it's ready.
+                    // The thread woke up because it's ready, indicating a writeable or error event.
 
                     let mut state = socket.state.borrow_mut();
                     let stream = match &*state {
@@ -1645,13 +1639,13 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     }
 
                     // There was no error during connecting. We still need to ensure that
-                    // the wakeup wasn't a spurious wakeup. We do this by attempting to
-                    // read the peer address of the socket.
+                    // the wakeup wasn't spurious. We do this by attempting to read the
+                    // peer address of the socket.
 
                     match stream.peer_addr() {
                         Ok(_) => { /* fall-through to below */},
-                        Err(e) if should_wait && (e.kind() == io::ErrorKind::NotConnected || e.kind() == io::ErrorKind::InProgress) => {
-                            // We received a spurious wake-up from the OS. This should be considered an OS bug:
+                        Err(e) if matches!(e.kind(), io::ErrorKind::NotConnected | io::ErrorKind::InProgress) => {
+                            // We received a spurious wakeup from the OS. This should be considered an OS bug:
                             // <https://github.com/tokio-rs/mio/issues/1942#issuecomment-4169378308>
                             panic!("{foreign_name}: received writeable event from OS but socket is not yet connected")
                         },
@@ -1664,8 +1658,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         }
                     }
 
-                    // We were able to read the peer address.
-                    // This means that the connection is now established.
+                    // We were able to read the peer address, which means
+                    // that the connection is now established.
 
                     // Temporarily use dummy state to take ownership of the stream.
                     let SocketState::Connecting(stream) = std::mem::replace(&mut*state, SocketState::Initial) else {
