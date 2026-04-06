@@ -1650,16 +1650,13 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             panic!("{foreign_name}: received writeable event from OS but socket is not yet connected")
                         },
                         Err(_) => {
-                            // Getting the peer address should only fail for system errors (e.g. ENOBUFS or
-                            // WSAENETDOWN) when the socket is connected successfully. Since most socket syscalls
-                            // don't have those specific errors, it's better to panic in this case
-                            // rather than returning it for a syscall for which it doesn't exist.
-                            panic!()
+                            // For all other errors the socket is connected. Since we're not interested in the
+                            // peer address and only want to know whether the socket is connected, we can ignore
+                            // the error and continue.
                         }
                     }
 
-                    // We were able to read the peer address, which means
-                    // that the connection is now established.
+                    // The connection is established.
 
                     // Temporarily use dummy state to take ownership of the stream.
                     let SocketState::Connecting(stream) = std::mem::replace(&mut*state, SocketState::Initial) else {
