@@ -1,9 +1,8 @@
 //@only-target: linux android freebsd solaris illumos # Currently we only support targets which can create non-blocking sockets using the `socket` syscall.
 //@compile-flags: -Zmiri-disable-isolation
-//@revisions: windows_host apple_host other_unix_host
-//@[other_unix_host] ignore-host: windows apple
+//@revisions: windows_host unix_host
+//@[unix_host] ignore-host: windows
 //@[windows_host] only-host: windows
-//@[apple_host] only-host: apple
 
 #![feature(io_error_inprogress)]
 
@@ -102,14 +101,15 @@ fn test_send_recv_nonblock() {
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
 
-        if cfg!(any(other_unix_host, apple_host)) {
-            // We can only test whether non-blocking writes would block once the buffer is full
-            // on UNIX hosts.
+        if !cfg!(windows_host) {
+            // We cannot test this part on Windows hosts because it seems as if Windows
+            // provides an infinite write buffer for localhost connections. Thus it doesn't make
+            // sense to test filling up that buffer on Windows hosts and therefore we don't need
+            // to read here.
 
             // After the `TEST_BYTES` the buffer should only contain ones.
-            // We exemplary test that some bytes were written, but since we don't know the
-            // exact buffer size (or how many bytes were exactly written before the EWOULDBLOCK)
-            // we can't read the whole buffer.
+            // We just test that _some_ bytes were written since we don't know the exact
+            // amount of bytes written before the EWOULDBLOCK.
             let mut buffer = [0; 1000];
             let bytes_read = unsafe {
                 errno_result(libc_utils::net::recv_all(
@@ -167,7 +167,7 @@ fn test_send_recv_nonblock() {
         match read_result {
             Ok(read) => bytes_read += read as usize,
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                // No data to read; Yield to peer to write more bytes into the buffer.
+                // No data to read; yield to server to write more bytes into the buffer.
                 thread::sleep(Duration::from_millis(50))
             }
             Err(err) => {
@@ -192,10 +192,9 @@ fn test_send_recv_nonblock() {
     };
     assert_eq!(bytes_written as usize, TEST_BYTES.len());
 
-    if cfg!(any(apple_host, other_unix_host)) {
-        // We can only test filling the buffer on UNIX because on
-        // Windows the receive buffer of a localhost socket dynamically
-        // grows.
+    if !cfg!(windows_host) {
+        // We cannot test this on Windows since there apparently the send buffer
+        // never fills up, at least for localhost connections.
 
         let fill_buf = [1u8; 5_000_000];
         // This fills the socket receive buffer and thus should start blocking.
@@ -260,14 +259,15 @@ fn test_send_recv_dontwait() {
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
 
-        if cfg!(any(other_unix_host, apple_host)) {
-            // We can only test whether non-blocking writes would block once the buffer is full
-            // on UNIX hosts.
+        if !cfg!(windows_host) {
+            // We cannot test this part on Windows hosts because it seems as if Windows
+            // provides an infinite write buffer for localhost connections. Thus it doesn't make
+            // sense to test filling up that buffer on Windows hosts and therefore we don't need
+            // to read here.
 
             // After the `TEST_BYTES` the buffer should only contain ones.
-            // We exemplary test that some bytes were written, but since we don't know the
-            // exact buffer size (or how many bytes were exactly written before the EWOULDBLOCK)
-            // we can't read the whole buffer.
+            // We just test that _some_ bytes were written since we don't know the exact
+            // amount of bytes written before the EWOULDBLOCK.
             let mut buffer = [0; 1000];
             let bytes_read = unsafe {
                 errno_result(libc_utils::net::recv_all(
@@ -320,7 +320,7 @@ fn test_send_recv_dontwait() {
         match read_result {
             Ok(read) => bytes_read += read as usize,
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                // No data to read; Yield to peer to write more bytes into the buffer.
+                // No data to read; yield to server to write more bytes into the buffer.
                 thread::sleep(Duration::from_millis(50))
             }
             Err(err) => {
@@ -345,10 +345,9 @@ fn test_send_recv_dontwait() {
     };
     assert_eq!(bytes_written as usize, TEST_BYTES.len());
 
-    if cfg!(any(apple_host, other_unix_host)) {
-        // We can only test filling the buffer on UNIX because on
-        // Windows the receive buffer of a localhost socket dynamically
-        // grows.
+    if !cfg!(windows_host) {
+        // We cannot test this on Windows since there apparently the send buffer
+        // never fills up, at least for localhost connections.
 
         let fill_buf = [1u8; 5_000_000];
         // This fills the socket receive buffer and thus should start blocking.
@@ -408,14 +407,15 @@ fn test_write_read_nonblock() {
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
 
-        if cfg!(any(other_unix_host, apple_host)) {
-            // We can only test whether non-blocking writes would block once the buffer is full
-            // on UNIX hosts.
+        if !cfg!(windows_host) {
+            // We cannot test this part on Windows hosts because it seems as if Windows
+            // provides an infinite write buffer for localhost connections. Thus it doesn't make
+            // sense to test filling up that buffer on Windows hosts and therefore we don't need
+            // to read here.
 
             // After the `TEST_BYTES` the buffer should only contain ones.
-            // We exemplary test that some bytes were written, but since we don't know the
-            // exact buffer size (or how many bytes were exactly written before the EWOULDBLOCK)
-            // we can't read the whole buffer.
+            // We just test that _some_ bytes were written since we don't know the exact
+            // amount of bytes written before the EWOULDBLOCK.
             let mut buffer = [0; 1000];
             let bytes_read = unsafe {
                 errno_result(libc_utils::read_all(peerfd, buffer.as_mut_ptr().cast(), buffer.len()))
@@ -466,7 +466,7 @@ fn test_write_read_nonblock() {
         match read_result {
             Ok(read) => bytes_read += read as usize,
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                // No data to read; Yield to peer to write more bytes into the buffer.
+                // No data to read; yield to server to write more bytes into the buffer.
                 thread::sleep(Duration::from_millis(50))
             }
             Err(err) => {
@@ -490,10 +490,9 @@ fn test_write_read_nonblock() {
     };
     assert_eq!(bytes_written as usize, TEST_BYTES.len());
 
-    if cfg!(any(other_unix_host, apple_host)) {
-        // We can only test filling the buffer on UNIX because on
-        // Windows the receive buffer of a localhost socket dynamically
-        // grows.
+    if !cfg!(windows_host) {
+        // We cannot test this on Windows since there apparently the send buffer
+        // never fills up, at lesat for localhost connections.
 
         let fill_buf = [1u8; 5_000_000];
         // This fills the socket receive buffer and thus should start blocking.
@@ -513,7 +512,7 @@ fn test_write_read_nonblock() {
 
 /// Test the `getpeername` syscall on a non-blocking IPv4 socket.
 /// For a connecting socket, the `getpeername` syscall should
-/// return an EINPROGRESS whilst for connected sockets it should
+/// return an ENOTCONN whilst for connected sockets it should
 /// return the same address as the socket was connected to.
 fn test_getpeername_ipv4_nonblock() {
     // Create a new non-blocking client socket.
@@ -522,37 +521,13 @@ fn test_getpeername_ipv4_nonblock() {
             .unwrap()
     };
 
-    // Blackhole address where the socket stays in connecting state but never
-    // successfully connects:
-    // <https://www.rfc-editor.org/rfc/rfc5737>
-    let blackhole_addr = net::sock_addr_ipv4([192, 0, 2, 1], 0);
-
-    let err = net::connect_ipv4(client_sockfd, blackhole_addr).unwrap_err();
+    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
 
     // Non-blocking connect should fail with EINPROGRESS.
-    match err.kind() {
-        ErrorKind::InProgress => { /* fall-through to below */ }
-        ErrorKind::AddrNotAvailable => {
-            // Windows and Apple hosts won't attempt
-            // to connect to the blackhole IP address
-            // and just return EADDRNOTAVAIL.
-            // In those cases we need to abort the
-            // test since the subsequent statements
-            // rely on the assumption that the socket is
-            // still not successfully connected.
-            assert!(
-                cfg!(any(windows_host, apple_host)),
-                "only Windows and Apple hosts ignore blackhole IP addresses"
-            );
-            return;
-        }
-        // All other errors should not happen.
-        _ => panic!(),
-    }
+    let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InProgress);
 
-    assert!(cfg!(other_unix_host), "blackhole IP addresses only work on non-apple UNIX hosts");
-
-    // Since we're connecting to a blackhole IP address, the socket should never be
+    // Since we're never accepting the connection, the socket should never be
     // successfully connected and thus we should be unable to read the peername.
     let Err(err) = net::sockname_ipv4(|storage, len| unsafe {
         libc::getpeername(client_sockfd, storage, len)
@@ -577,14 +552,7 @@ fn test_getpeername_ipv4_nonblock() {
     thread::sleep(Duration::from_millis(10));
 
     // Non-blocking connects always "fail" with EINPROGRESS.
-    let err = unsafe {
-        errno_result(libc::connect(
-            client_sockfd,
-            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ))
-        .unwrap_err()
-    };
+    let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InProgress);
 
     // It should be reasonable to assume that a localhost connection should be established
