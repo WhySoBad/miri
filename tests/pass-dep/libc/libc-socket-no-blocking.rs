@@ -1,7 +1,8 @@
 //@only-target: linux android freebsd solaris illumos # Currently we only support targets which can create non-blocking sockets using the `socket` syscall.
 //@compile-flags: -Zmiri-disable-isolation
-//@revisions: windows_host unix_host
-//@[unix_host] ignore-host: windows
+//@revisions: windows_host apple_host other_unix_host
+//@[other_unix_host] ignore-host: apple windows
+//@[apple_host] only-host: apple
 //@[windows_host] only-host: windows
 
 #![feature(io_error_inprogress)]
@@ -523,9 +524,22 @@ fn test_getpeername_ipv4_nonblock() {
 
     let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
 
-    // Non-blocking connect should fail with EINPROGRESS.
     let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::InProgress);
+
+    match err.kind() {
+        ErrorKind::InProgress if cfg!(other_unix_host) => {
+            // Non-blocking connect should fail with EINPROGRESS.
+
+            /* fall-through to below */
+        }
+        ErrorKind::AddrNotAvailable if !cfg!(other_unix_host) => {
+            // On Windows and Apple hosts, a `connect` syscall instantly
+            // returns EADDRNOTAVAILABLE should there be no accepting socket
+            // for a localhost address.
+            return;
+        }
+        _ => panic!(),
+    }
 
     // Since we're never accepting the connection, the socket should never be
     // successfully connected and thus we should be unable to read the peername.
