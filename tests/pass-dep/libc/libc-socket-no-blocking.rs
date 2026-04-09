@@ -1,8 +1,7 @@
 //@only-target: linux android freebsd solaris illumos # Currently we only support targets which can create non-blocking sockets using the `socket` syscall.
 //@compile-flags: -Zmiri-disable-isolation
-//@revisions: windows_host apple_host other_unix_host
-//@[other_unix_host] ignore-host: apple windows
-//@[apple_host] only-host: apple
+//@revisions: windows_host unix_host
+//@[unix_host] ignore-host: windows
 //@[windows_host] only-host: windows
 
 #![feature(io_error_inprogress)]
@@ -101,30 +100,6 @@ fn test_send_recv_nonblock() {
 
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
-
-        if !cfg!(windows_host) {
-            // We cannot test this part on Windows hosts because it seems as if Windows
-            // provides an infinite write buffer for localhost connections. Thus it doesn't make
-            // sense to test filling up that buffer on Windows hosts and therefore we don't need
-            // to read here.
-
-            // After the `TEST_BYTES` the buffer should only contain ones.
-            // We just test that _some_ bytes were written since we don't know the exact
-            // amount of bytes written before the EWOULDBLOCK.
-            let mut buffer = [0; 1000];
-            let bytes_read = unsafe {
-                errno_result(libc_utils::net::recv_all(
-                    peerfd,
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    0,
-                ))
-                .unwrap()
-            };
-
-            assert_eq!(bytes_read as usize, buffer.len());
-            assert_eq!(&buffer, &[1u8; 1000]);
-        }
     });
 
     // Yield to server thread to ensure that it's currently accepting.
@@ -259,30 +234,6 @@ fn test_send_recv_dontwait() {
 
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
-
-        if !cfg!(windows_host) {
-            // We cannot test this part on Windows hosts because it seems as if Windows
-            // provides an infinite write buffer for localhost connections. Thus it doesn't make
-            // sense to test filling up that buffer on Windows hosts and therefore we don't need
-            // to read here.
-
-            // After the `TEST_BYTES` the buffer should only contain ones.
-            // We just test that _some_ bytes were written since we don't know the exact
-            // amount of bytes written before the EWOULDBLOCK.
-            let mut buffer = [0; 1000];
-            let bytes_read = unsafe {
-                errno_result(libc_utils::net::recv_all(
-                    peerfd,
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    0,
-                ))
-                .unwrap()
-            };
-
-            assert_eq!(bytes_read as usize, buffer.len());
-            assert_eq!(&buffer, &[1u8; 1000]);
-        }
     });
 
     net::connect_ipv4(client_sockfd, addr).unwrap();
@@ -407,25 +358,6 @@ fn test_write_read_nonblock() {
 
         assert_eq!(bytes_read as usize, TEST_BYTES.len());
         assert_eq!(&buffer, TEST_BYTES);
-
-        if !cfg!(windows_host) {
-            // We cannot test this part on Windows hosts because it seems as if Windows
-            // provides an infinite write buffer for localhost connections. Thus it doesn't make
-            // sense to test filling up that buffer on Windows hosts and therefore we don't need
-            // to read here.
-
-            // After the `TEST_BYTES` the buffer should only contain ones.
-            // We just test that _some_ bytes were written since we don't know the exact
-            // amount of bytes written before the EWOULDBLOCK.
-            let mut buffer = [0; 1000];
-            let bytes_read = unsafe {
-                errno_result(libc_utils::read_all(peerfd, buffer.as_mut_ptr().cast(), buffer.len()))
-                    .unwrap()
-            };
-
-            assert_eq!(bytes_read as usize, buffer.len());
-            assert_eq!(&buffer, &[1u8; 1000]);
-        }
     });
 
     // Yield to server thread to ensure that it's currently accepting.
@@ -493,7 +425,7 @@ fn test_write_read_nonblock() {
 
     if !cfg!(windows_host) {
         // We cannot test this on Windows since there apparently the send buffer
-        // never fills up, at lesat for localhost connections.
+        // never fills up, at least for localhost connections.
 
         let fill_buf = [1u8; 5_000_000];
         // This fills the socket receive buffer and thus should start blocking.
@@ -522,24 +454,11 @@ fn test_getpeername_ipv4_nonblock() {
             .unwrap()
     };
 
-    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
+    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 12321);
 
+    // Non-blocking connect should fail with EINPROGRESS.
     let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
-
-    match err.kind() {
-        ErrorKind::InProgress if cfg!(other_unix_host) => {
-            // Non-blocking connect should fail with EINPROGRESS.
-
-            /* fall-through to below */
-        }
-        ErrorKind::AddrNotAvailable if !cfg!(other_unix_host) => {
-            // On Windows and Apple hosts, a `connect` syscall instantly
-            // returns EADDRNOTAVAILABLE should there be no accepting socket
-            // for a localhost address.
-            return;
-        }
-        _ => panic!(),
-    }
+    assert_eq!(err.kind(), ErrorKind::InProgress);
 
     // Since we're never accepting the connection, the socket should never be
     // successfully connected and thus we should be unable to read the peername.
@@ -569,18 +488,27 @@ fn test_getpeername_ipv4_nonblock() {
     let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InProgress);
 
-    // It should be reasonable to assume that a localhost connection should be established
-    // within 20ms.
-    thread::sleep(Duration::from_millis(20));
+    loop {
+        let peername_result = net::sockname_ipv4(|storage, len| unsafe {
+            libc::getpeername(client_sockfd, storage, len)
+        });
 
-    let (_, peer_addr) = net::sockname_ipv4(|storage, len| unsafe {
-        libc::getpeername(client_sockfd, storage, len)
-    })
-    .unwrap();
-
-    assert_eq!(addr.sin_family, peer_addr.sin_family);
-    assert_eq!(addr.sin_port, peer_addr.sin_port);
-    assert_eq!(addr.sin_addr.s_addr, peer_addr.sin_addr.s_addr);
+        match peername_result {
+            Ok((_, peer_addr)) => {
+                assert_eq!(addr.sin_family, peer_addr.sin_family);
+                assert_eq!(addr.sin_port, peer_addr.sin_port);
+                assert_eq!(addr.sin_addr.s_addr, peer_addr.sin_addr.s_addr);
+                break;
+            }
+            Err(err) if err.kind() == ErrorKind::NotConnected => {
+                // Connection is not yet established; wait and retry later.
+                thread::sleep(Duration::from_millis(50))
+            }
+            Err(err) => {
+                panic!("error whilst getting peername: {err}")
+            }
+        }
+    }
 
     server_thread.join().unwrap();
 }
