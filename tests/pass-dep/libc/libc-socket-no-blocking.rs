@@ -454,7 +454,16 @@ fn test_getpeername_ipv4_nonblock() {
             .unwrap()
     };
 
-    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 12321);
+    // We cannot attempt to connect to a localhost address because
+    // it could be the case that a socket from another test is
+    // currently listening on `localhost:12321` because we bind to
+    // random ports everywhere. For `192.0.2.1` we know that nothing is
+    // listening because it's a blackhole address:
+    // <https://www.rfc-editor.org/rfc/rfc5737>
+    // The port `12321` is just a random non-zero port because Windows
+    // and Apple hosts return EADDRNOTAVAIL when attempting to connect to
+    // a zero port.
+    let addr = net::sock_addr_ipv4([192, 0, 2, 1], 12321);
 
     // Non-blocking connect should fail with EINPROGRESS.
     let err = net::connect_ipv4(client_sockfd, addr).unwrap_err();
@@ -502,7 +511,7 @@ fn test_getpeername_ipv4_nonblock() {
             }
             Err(err) if err.kind() == ErrorKind::NotConnected => {
                 // Connection is not yet established; wait and retry later.
-                thread::sleep(Duration::from_millis(50))
+                thread::sleep(Duration::from_millis(10))
             }
             Err(err) => {
                 panic!("error whilst getting peername: {err}")
