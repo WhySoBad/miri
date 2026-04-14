@@ -76,6 +76,20 @@ pub struct EpollEvents {
     pub epollerr: bool,
 }
 
+// Best-effort mapping between mio's cross-platform readiness events
+// and epoll events.
+impl From<&mio::event::Event> for EpollEvents {
+    fn from(event: &mio::event::Event) -> Self {
+        EpollEvents {
+            epollin: event.is_readable(),
+            epollout: event.is_writable(),
+            epollrdhup: event.is_read_closed(),
+            epollhup: event.is_write_closed(),
+            epollerr: event.is_error(),
+        }
+    }
+}
+
 impl EpollEvents {
     pub fn new() -> Self {
         EpollEvents {
@@ -347,11 +361,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 interest.data = data;
             }
 
+            let active_events =
+                fd_ref.as_unix(this).epoll_active_events(this)?.get_event_bitmask(this);
+
             // Deliver events for the new interest.
             update_readiness(
                 this,
                 &epfd,
-                fd_ref.as_unix(this).epoll_active_events()?.get_event_bitmask(this),
+                active_events,
                 /* force_edge */ true,
                 move |callback| {
                     // Need to release the RefCell when this closure returns, so we have to move
@@ -509,10 +526,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ///
     /// If `force_edge` is set, edge-triggered interests will be triggered even if the set of
     /// ready events did not change. This can lead to spurious wakeups. Use with caution!
+    ///
+    /// When `events` is [`Some`], the call to `epoll_active_events` is skipped and the provided
+    /// events are used instead. For most cases, `events` should just be [`None`].
     fn update_epoll_active_events(
         &mut self,
         fd_ref: DynFileDescriptionRef,
         force_edge: bool,
+        events: Option<EpollEvents>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let id = fd_ref.id();
@@ -527,7 +548,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     .expect("someone forgot to remove the garbage from `machine.epoll_interests`")
             })
             .collect::<Vec<_>>();
-        let active_events = fd_ref.as_unix(this).epoll_active_events()?.get_event_bitmask(this);
+        let active_events = events
+            .unwrap_or(fd_ref.as_unix(this).epoll_active_events(this)?)
+            .get_event_bitmask(this);
         for epoll in epolls {
             update_readiness(this, &epoll, active_events, force_edge, |callback| {
                 for (&key, interest) in epoll.interest_list.borrow_mut().range_mut(range_for_id(id))
@@ -605,8 +628,8 @@ fn return_ready_list<'tcx>(
         for (key, interest) in interest_list.iter() {
             // Ensure this matches the latest readiness of this FD.
             // We have to do an FD lookup by ID for this. The FdNum might be already closed.
-            let fd = &ecx.machine.fds.fds.values().find(|fd| fd.id() == key.0).unwrap();
-            let current_active = fd.as_unix(ecx).epoll_active_events()?.get_event_bitmask(ecx);
+            let fd = ecx.machine.fds.fds.values().find(|fd| fd.id() == key.0).unwrap().clone();
+            let current_active = fd.as_unix(ecx).epoll_active_events(ecx)?.get_event_bitmask(ecx);
             assert_eq!(interest.active_events, current_active & interest.relevant_events);
         }
     }

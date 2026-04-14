@@ -77,7 +77,10 @@ pub trait UnixFileDescription: FileDescription {
     }
 
     /// Return which epoll events are currently active.
-    fn epoll_active_events<'tcx>(&self) -> InterpResult<'tcx, EpollEvents> {
+    fn epoll_active_events<'tcx>(
+        &self,
+        _ecx: &mut MiriInterpCx<'tcx>,
+    ) -> InterpResult<'tcx, EpollEvents> {
         throw_unsup_format!("{}: epoll does not support this file description", self.name());
     }
 }

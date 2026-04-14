@@ -6,7 +6,7 @@ use mio::event::Source;
 use mio::{Events, Interest, Poll, Token};
 use rustc_data_structures::fx::FxHashMap;
 
-use crate::shims::{FdId, FileDescriptionRef};
+use crate::shims::{EpollEvents, FdId, FileDescription, FileDescriptionRef};
 use crate::*;
 
 /// Capacity of the event queue which can be polled at a time.
@@ -15,7 +15,7 @@ use crate::*;
 const IO_EVENT_CAPACITY: usize = 16;
 
 /// Trait for values that contain a mio [`Source`].
-pub trait WithSource {
+pub trait WithSource: FileDescription {
     /// Invoke `f` on the source inside `self`.
     fn with_source(&self, f: &mut dyn FnMut(&mut dyn Source) -> io::Result<()>) -> io::Result<()>;
 }
@@ -39,7 +39,10 @@ pub enum InterestReceiver {
 pub struct BlockingIoManager {
     /// Poll instance to monitor I/O events from the OS.
     /// This is only [`None`] when Miri is run with isolation enabled.
-    poll: Option<Poll>,
+    events_poll: Option<Poll>,
+    /// Poll instance for querying I/O readiness from the OS.
+    /// This is only [`None`] when Miri is run with isolation enabled.
+    readiness_poll: Option<Poll>,
     /// Buffer used to store the ready I/O events when calling [`Poll::poll`].
     /// This is not part of the state and only stored to avoid allocating a
     /// new buffer for every poll.
@@ -55,7 +58,8 @@ impl BlockingIoManager {
     /// of communication with the host.
     pub fn new(communicate: bool) -> Result<Self, io::Error> {
         let manager = Self {
-            poll: communicate.then_some(Poll::new()?),
+            events_poll: communicate.then_some(Poll::new()?),
+            readiness_poll: communicate.then_some(Poll::new()?),
             events: Events::with_capacity(IO_EVENT_CAPACITY),
             sources: BTreeMap::default(),
         };
@@ -76,8 +80,10 @@ impl BlockingIoManager {
         &mut self,
         timeout: Option<Duration>,
     ) -> Result<Vec<(InterestReceiver, FileDescriptionRef<dyn WithSource>)>, io::Error> {
-        let poll =
-            self.poll.as_mut().expect("Blocking I/O should not be called with isolation enabled");
+        let poll = self
+            .events_poll
+            .as_mut()
+            .expect("Blocking I/O should not be called with isolation enabled");
 
         // Poll for new I/O events from OS and store them in the events buffer.
         poll.poll(&mut self.events, timeout)?;
@@ -116,8 +122,10 @@ impl BlockingIoManager {
         receiver: InterestReceiver,
         interest: Interest,
     ) {
-        let poll =
-            self.poll.as_ref().expect("Blocking I/O should not be called with isolation enabled");
+        let poll = self
+            .events_poll
+            .as_ref()
+            .expect("Blocking I/O should not be called with isolation enabled");
 
         let id = source_fd.id();
         let token = Token(id.to_usize());
@@ -160,8 +168,10 @@ impl BlockingIoManager {
     ///
     /// The receiver is assumed to be registered for the provided source!
     pub fn deregister(&mut self, source_id: FdId, receiver: InterestReceiver) {
-        let poll =
-            self.poll.as_ref().expect("Blocking I/O should not be called with isolation enabled");
+        let poll = self
+            .events_poll
+            .as_ref()
+            .expect("Blocking I/O should not be called with isolation enabled");
 
         let token = Token(source_id.to_usize());
         let (fd, current_interests) =
@@ -188,6 +198,50 @@ impl BlockingIoManager {
         // fail due to system resource errors (e.g. ENOMEM or ENOSPC).
         fd.with_source(&mut |source| poll.registry().reregister(source, token, new_interest))
             .unwrap();
+    }
+
+    /// Query the I/O readiness for a blocking I/O source.
+    pub fn query_readiness(&mut self, source_fd: &impl WithSource) -> EpollEvents {
+        let poll = self
+            .readiness_poll
+            .as_mut()
+            .expect("Blocking I/O should not be called with isolation enabled");
+
+        // Since the poll is always empty, we can reuse the same token for all registrations.
+        let token = Token(0);
+        // Just use any interest because we get the initial event containing the current
+        // readiness anyways.
+        let interests = Interest::READABLE | Interest::WRITABLE;
+
+        // Treat errors from registering as fatal. On UNIX hosts this can only
+        // fail due to system resource errors (e.g. ENOMEM or ENOSPC).
+        source_fd
+            .with_source(&mut |source| poll.registry().register(source, token, interests))
+            .unwrap();
+
+        loop {
+            // Perform a non-blocking poll for new I/O events from the OS and store
+            // them in the events buffer.
+            match poll.poll(&mut self.events, None) {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    // Interrupts are not fatal; we can just repeat the poll and should succeed.
+                }
+                Err(e) => panic!("unexpected error while polling: {e}"),
+            }
+        }
+
+        let event = self
+            .events
+            .iter()
+            .nth(0)
+            .expect("An event should be returned after adding a source to the poll");
+
+        // Treat errors from deregistering as fatal. On UNIX hosts this can only
+        // fail due to system resource errors (e.g. ENOMEM or ENOSPC).
+        source_fd.with_source(&mut |source| poll.registry().deregister(source)).unwrap();
+
+        EpollEvents::from(event)
     }
 }
 

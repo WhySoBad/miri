@@ -98,7 +98,7 @@ impl FileDescription for AnonSocket {
                 }
             }
             // Notify peer fd that close has happened, since that can unblock reads and writes.
-            ecx.update_epoll_active_events(peer_fd, /* force_edge */ false)?;
+            ecx.update_epoll_active_events(peer_fd, /* force_edge */ false, None)?;
         }
         interp_ok(Ok(()))
     }
@@ -271,8 +271,8 @@ fn anonsocket_write<'tcx>(
         // Notify epoll waiters: we might be no longer writable, peer might now be readable.
         // The notification to the peer seems to be always sent on Linux, even if the
         // FD was readable before.
-        ecx.update_epoll_active_events(self_ref, /* force_edge */ false)?;
-        ecx.update_epoll_active_events(peer_fd, /* force_edge */ true)?;
+        ecx.update_epoll_active_events(self_ref, /* force_edge */ false, None)?;
+        ecx.update_epoll_active_events(peer_fd, /* force_edge */ true, None)?;
 
         return finish.call(ecx, Ok(write_size));
     }
@@ -369,10 +369,10 @@ fn anonsocket_read<'tcx>(
             // Linux seems to always notify the peer if the read buffer is now empty.
             // (Linux also does that if this was a "big" read, but to avoid some arbitrary
             // threshold, we do not match that.)
-            ecx.update_epoll_active_events(peer_fd, /* force_edge */ readbuf_now_empty)?;
+            ecx.update_epoll_active_events(peer_fd, /* force_edge */ readbuf_now_empty, None)?;
         };
         // Notify epoll waiters: we might be no longer readable.
-        ecx.update_epoll_active_events(self_ref, /* force_edge */ false)?;
+        ecx.update_epoll_active_events(self_ref, /* force_edge */ false, None)?;
 
         return finish.call(ecx, Ok(read_size));
     }
@@ -380,7 +380,10 @@ fn anonsocket_read<'tcx>(
 }
 
 impl UnixFileDescription for AnonSocket {
-    fn epoll_active_events<'tcx>(&self) -> InterpResult<'tcx, EpollEvents> {
+    fn epoll_active_events<'tcx>(
+        &self,
+        _ecx: &mut MiriInterpCx<'tcx>,
+    ) -> InterpResult<'tcx, EpollEvents> {
         // We only check the status of EPOLLIN, EPOLLOUT, EPOLLHUP and EPOLLRDHUP flags.
         // If other event flags need to be supported in the future, the check should be added here.
 

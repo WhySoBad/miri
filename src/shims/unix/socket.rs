@@ -14,6 +14,7 @@ use rustc_middle::throw_unsup_format;
 use rustc_target::spec::Os;
 
 use crate::concurrency::blocking_io::InterestReceiver;
+use crate::shims::EpollEvents;
 use crate::shims::files::{EvalContextExt as _, FdId, FileDescription, FileDescriptionRef};
 use crate::shims::unix::UnixFileDescription;
 use crate::*;
@@ -246,6 +247,14 @@ impl UnixFileDescription for Socket {
         }
 
         throw_unsup_format!("ioctl: unsupported operation {op:#x} on socket");
+    }
+
+    fn epoll_active_events<'tcx>(
+        &self,
+        ecx: &mut MiriInterpCx<'tcx>,
+    ) -> InterpResult<'tcx, EpollEvents> {
+        let epoll_events = ecx.machine.blocking_io.query_readiness(self);
+        interp_ok(epoll_events)
     }
 }
 
