@@ -19,7 +19,7 @@ use rustc_target::spec::Os;
 
 use crate::concurrency::GlobalDataRaceHandler;
 use crate::concurrency::blocking_io::InterestReceiver;
-use crate::shims::tls;
+use crate::shims::{EpollEvalContextExt, tls};
 use crate::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -734,7 +734,7 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
             // which received events are available for scheduling afterwards.
 
             // Perform a non-blocking poll for newly available I/O events from the OS.
-            this.poll_and_unblock(Some(Duration::ZERO))?;
+            this.poll_and_handle_receivers(Some(Duration::ZERO))?;
         }
 
         // We also check timeouts before running any other thread, to ensure that timeouts
@@ -811,7 +811,10 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
 
     /// Poll for I/O events until either an I/O event happened or the timeout expired.
     /// The different timeout values are described in [`BlockingIoManager::poll`].
-    fn poll_and_unblock(&mut self, timeout: Option<Duration>) -> InterpResult<'tcx> {
+    ///
+    /// For all returned I/O events, do the action specified for the [`InterestReceiver`]
+    /// of the event.
+    fn poll_and_handle_receivers(&mut self, timeout: Option<Duration>) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
         let ready = match this.machine.blocking_io.poll(timeout) {
@@ -823,10 +826,16 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
             Err(e) => panic!("unexpected error while polling: {e}"),
         };
 
-        ready.into_iter().try_for_each(|(receiver, _source)| {
-            match receiver {
-                InterestReceiver::UnblockThread(thread_id) =>
-                    this.unblock_thread(thread_id, BlockReason::IO),
+        ready.into_iter().try_for_each(|(receiver, source)| {
+            match &receiver {
+                InterestReceiver::UnblockThread(thread_id) => {
+                    this.machine.blocking_io.deregister(source.id(), receiver);
+                    this.unblock_thread(*thread_id, BlockReason::IO)
+                }
+                InterestReceiver::Epoll { event_key: (_fd_id, fd_num), .. } => {
+                    let fd = this.machine.fds.get(*fd_num).expect("File description should exist");
+                    this.update_epoll_active_events(fd, false, None)
+                }
             }
         })
     }
@@ -1347,7 +1356,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         // strictly sleeping the duration we allow waking up
                         // early for I/O events from the OS.
 
-                        this.poll_and_unblock(duration)?;
+                        this.poll_and_handle_receivers(duration)?;
                     } else {
                         let duration = duration.expect(
                             "Infinite sleep should not be triggered when isolation is enabled",

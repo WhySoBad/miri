@@ -13,7 +13,7 @@ use crate::shims::files::{
 use crate::shims::unix::UnixFileDescription;
 use crate::*;
 
-type EpollEventKey = (FdId, FdNum);
+pub type EpollEventKey = (FdId, FdNum);
 
 /// An `Epoll` file descriptor connects file handles and epoll events
 #[derive(Debug, Default)]
@@ -53,6 +53,17 @@ pub struct EpollEventInterest {
     /// but only u64 is supported for now.
     /// <https://man7.org/linux/man-pages/man3/epoll_event.3type.html>
     data: u64,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum EpollInterestChangeReason {
+    /// A new [`EpollEventKey`] with some interests got added to the
+    /// epoll instance.
+    Add,
+    /// The interests for the [`EpollEventKey`] changed for the epoll instance.
+    Modify,
+    /// The [`EpollEventKey`] got removed from the epoll instance.
+    Remove,
 }
 
 /// EpollReadyEvents reflects the readiness of a file description.
@@ -352,6 +363,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // We already had interest in this.
                     return this.set_last_error_and_return_i32(LibcError("EEXIST"));
                 }
+
+                fd_ref.as_unix(this).on_epoll_interest_change(
+                    this,
+                    epfd.clone(),
+                    epoll_key,
+                    EpollInterestChangeReason::Add,
+                )?;
             } else {
                 // Modify the existing interest.
                 let Some(interest) = interest_list.get_mut(&epoll_key) else {
@@ -377,6 +395,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 },
             )?;
 
+            fd_ref.as_unix(this).on_epoll_interest_change(
+                this,
+                epfd,
+                epoll_key,
+                EpollInterestChangeReason::Modify,
+            )?;
+
             interp_ok(Scalar::from_i32(0))
         } else if op == epoll_ctl_del {
             let epoll_key = (id, fd);
@@ -392,6 +417,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             if interest_list.range(range_for_id(id)).next().is_none() {
                 this.machine.epoll_interests.remove(id, epfd.id());
             }
+
+            drop(interest_list);
+            fd_ref.as_unix(this).on_epoll_interest_change(
+                this,
+                epfd,
+                epoll_key,
+                EpollInterestChangeReason::Remove,
+            )?;
 
             interp_ok(Scalar::from_i32(0))
         } else {

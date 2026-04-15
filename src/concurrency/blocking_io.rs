@@ -4,9 +4,8 @@ use std::time::Duration;
 
 use mio::event::Source;
 use mio::{Events, Interest, Poll, Token};
-use rustc_data_structures::fx::FxHashMap;
 
-use crate::shims::{EpollEvents, FdId, FileDescription, FileDescriptionRef};
+use crate::shims::{EpollEventKey, EpollEvents, FdId, FileDescription, FileDescriptionRef};
 use crate::*;
 
 /// Capacity of the event queue which can be polled at a time.
@@ -22,10 +21,13 @@ pub trait WithSource: FileDescription {
 
 /// An interest receiver defines the action that should be taken when
 /// the associated [`Interest`] is fulfilled.
-#[derive(Debug, Hash, PartialEq, Clone, Copy, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, PartialOrd, Ord)]
 pub enum InterestReceiver {
     /// The specified thread should be unblocked.
     UnblockThread(ThreadId),
+    /// The specified [`EpollEventKey`] received a readiness event on the epoll
+    /// file description with id `epfd_id`.
+    Epoll { epfd_id: FdId, event_key: EpollEventKey },
 }
 
 /// Manager for managing blocking host I/O in a non-blocking manner.
@@ -50,7 +52,7 @@ pub struct BlockingIoManager {
     /// Map from source ids to the actual sources and their registered receivers
     /// together with their associated interests.
     sources:
-        BTreeMap<FdId, (FileDescriptionRef<dyn WithSource>, FxHashMap<InterestReceiver, Interest>)>,
+        BTreeMap<FdId, (FileDescriptionRef<dyn WithSource>, BTreeMap<InterestReceiver, Interest>)>,
 }
 
 impl BlockingIoManager {
@@ -104,9 +106,6 @@ impl BlockingIoManager {
             })
             .collect::<Vec<_>>();
 
-        // Deregister all ready sources as we only want to receive one event per receiver.
-        ready.iter().for_each(|(receiver, source)| self.deregister(source.id(), *receiver));
-
         Ok(ready)
     }
 
@@ -139,7 +138,7 @@ impl BlockingIoManager {
                 .with_source(&mut |source| poll.registry().register(source, token, interest))
                 .unwrap();
 
-            self.sources.insert(id, (source_fd, FxHashMap::from_iter([(receiver, interest)])));
+            self.sources.insert(id, (source_fd, BTreeMap::from_iter([(receiver, interest)])));
             return;
         };
 
@@ -246,7 +245,7 @@ impl BlockingIoManager {
 }
 
 /// Get the union of all interests for a source. Returns `None` if the map is empty.
-fn interest_union(interests: &FxHashMap<InterestReceiver, Interest>) -> Option<Interest> {
+fn interest_union(interests: &BTreeMap<InterestReceiver, Interest>) -> Option<Interest> {
     interests
         .values()
         .copied()

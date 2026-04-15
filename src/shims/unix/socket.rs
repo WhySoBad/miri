@@ -14,9 +14,11 @@ use rustc_middle::throw_unsup_format;
 use rustc_target::spec::Os;
 
 use crate::concurrency::blocking_io::InterestReceiver;
-use crate::shims::EpollEvents;
-use crate::shims::files::{EvalContextExt as _, FdId, FileDescription, FileDescriptionRef};
-use crate::shims::unix::UnixFileDescription;
+use crate::shims::files::{
+    DynFileDescriptionRef, EvalContextExt as _, FdId, FileDescription, FileDescriptionRef,
+};
+use crate::shims::unix::{EpollInterestChangeReason, UnixFileDescription};
+use crate::shims::{EpollEventKey, EpollEvents};
 use crate::*;
 
 #[derive(Debug, PartialEq)]
@@ -247,6 +249,57 @@ impl UnixFileDescription for Socket {
         }
 
         throw_unsup_format!("ioctl: unsupported operation {op:#x} on socket");
+    }
+
+    fn on_epoll_interest_change<'tcx>(
+        &self,
+        ecx: &mut MiriInterpCx<'tcx>,
+        epfd: DynFileDescriptionRef,
+        event_key: EpollEventKey,
+        reason: EpollInterestChangeReason,
+    ) -> InterpResult<'tcx> {
+        // We don't care about modifications for the same `event_key` because we already
+        // added the socket with all available interests to the poll.
+        if reason == EpollInterestChangeReason::Modify {
+            return interp_ok(());
+        }
+
+        let (fd_id, fd_num) = event_key;
+
+        // Since the blocking I/O manager only works with file description refs, we
+        // need to fetch a `FileDescriptionRef<Socket>` from the fd table because
+        // `self` is of type `&Socket`.
+        let socket = ecx
+            .machine
+            .fds
+            .get(fd_num)
+            .expect("File description should exist")
+            .downcast::<Socket>()
+            .expect("File description should be a socket");
+
+        assert_eq!(fd_id, socket.id());
+
+        let receiver = InterestReceiver::Epoll { epfd_id: epfd.id(), event_key };
+
+        match reason {
+            // The socket got newly added to the `epfd` epoll instance with key `event_key`.
+            EpollInterestChangeReason::Add => {
+                // Register the socket with all available interests to the poll.
+                ecx.machine.blocking_io.register(
+                    socket,
+                    receiver,
+                    // Readable and writable are the only interests which are available on
+                    // all host platforms.
+                    Interest::READABLE | Interest::WRITABLE,
+                )
+            }
+            // The socket got removed from the `epfd` epoll instance with key `event_key`.
+            EpollInterestChangeReason::Remove =>
+                ecx.machine.blocking_io.deregister(fd_id, receiver),
+            EpollInterestChangeReason::Modify => unreachable!(),
+        }
+
+        interp_ok(())
     }
 
     fn epoll_active_events<'tcx>(

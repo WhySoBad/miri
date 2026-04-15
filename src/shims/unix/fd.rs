@@ -8,7 +8,7 @@ use rand::Rng;
 use rustc_abi::Size;
 use rustc_target::spec::Os;
 
-use crate::shims::files::FileDescription;
+use crate::shims::files::{DynFileDescriptionRef, FileDescription};
 use crate::shims::sig::check_min_vararg_count;
 use crate::shims::unix::linux_like::epoll::EpollEvents;
 use crate::shims::unix::*;
@@ -74,6 +74,21 @@ pub trait UnixFileDescription: FileDescription {
         _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, i32> {
         throw_unsup_format!("cannot use ioctl on {}", self.name());
+    }
+
+    /// The epoll interests for a file descriptor of this file description
+    /// changed on an epoll instance.
+    /// `epfd` contains the epoll file description where the interests changed.
+    /// `event_key` is the mapping between file description id and file descriptor number.
+    /// `reason` is the reason why the interests for the file descriptor changed.
+    fn on_epoll_interest_change<'tcx>(
+        &self,
+        _ecx: &mut MiriInterpCx<'tcx>,
+        _epfd: DynFileDescriptionRef,
+        _event_key: EpollEventKey,
+        _reason: EpollInterestChangeReason,
+    ) -> InterpResult<'tcx> {
+        interp_ok(())
     }
 
     /// Return which epoll events are currently active.
