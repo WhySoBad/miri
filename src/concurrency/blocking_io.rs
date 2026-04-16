@@ -90,8 +90,6 @@ impl BlockingIoManager {
         // Poll for new I/O events from OS and store them in the events buffer.
         poll.poll(&mut self.events, timeout)?;
 
-        println!("--- start poll ---");
-
         let ready = self
             .events
             .iter()
@@ -111,8 +109,6 @@ impl BlockingIoManager {
                 interests.keys().map(move |receiver| (*receiver, source.clone()))
             })
             .collect::<Vec<_>>();
-
-        println!("--- end poll ---");
 
         Ok(ready)
     }
