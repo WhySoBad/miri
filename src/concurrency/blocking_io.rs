@@ -90,6 +90,8 @@ impl BlockingIoManager {
         // Poll for new I/O events from OS and store them in the events buffer.
         poll.poll(&mut self.events, timeout)?;
 
+        println!("--- start poll ---");
+
         let ready = self
             .events
             .iter()
@@ -100,11 +102,17 @@ impl BlockingIoManager {
                 let (source, interests) =
                     self.sources.get(&fd_id).expect("Source should be registered");
                 assert_eq!(source.id(), fd_id);
+
+                let epoll_events = EpollEvents::from(event);
+                println!("event = {epoll_events:?}");
+
                 // Because we allow spurious wake-ups, we mark all interests as ready even
                 // though some may not have been fulfilled.
                 interests.keys().map(move |receiver| (*receiver, source.clone()))
             })
             .collect::<Vec<_>>();
+
+        println!("--- end poll ---");
 
         Ok(ready)
     }
