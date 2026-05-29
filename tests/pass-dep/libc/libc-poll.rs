@@ -18,8 +18,7 @@ fn main() {
 /// Test that the `poll` call unblocks when one of the
 /// provided interests is fulfilled.
 fn test_poll_unblock_with_events() {
-    let flags = libc::EFD_NONBLOCK | libc::EFD_CLOEXEC;
-    let fd = errno_result(unsafe { libc::eventfd(0, flags) }).unwrap();
+    let fd = errno_result(unsafe { libc::eventfd(0, 0) }).unwrap();
 
     let mut interests = [libc::pollfd { fd, events: libc::POLLIN | libc::POLLOUT, revents: 0 }];
     let ready = unsafe {
@@ -34,8 +33,7 @@ fn test_poll_unblock_with_events() {
 /// Test that the `poll` blocks and returns zero when
 /// none of the provided interests get fulfilled.
 fn test_poll_block_without_events() {
-    let flags = libc::EFD_NONBLOCK | libc::EFD_CLOEXEC;
-    let fd = errno_result(unsafe { libc::eventfd(0, flags) }).unwrap();
+    let fd = errno_result(unsafe { libc::eventfd(0, 0) }).unwrap();
 
     let mut interests = [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }];
     let before = Instant::now();
@@ -52,8 +50,7 @@ fn test_poll_block_without_events() {
 /// interest array. This should set the `revents` for both entries in the
 /// interest array.
 fn test_poll_duplicate_fd_interest() {
-    let flags = libc::EFD_NONBLOCK | libc::EFD_CLOEXEC;
-    let fd = errno_result(unsafe { libc::eventfd(0, flags) }).unwrap();
+    let fd = errno_result(unsafe { libc::eventfd(0, 0) }).unwrap();
 
     let mut interests = [
         libc::pollfd { fd, events: libc::POLLIN | libc::POLLOUT, revents: 0 },
