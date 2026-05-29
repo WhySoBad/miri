@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
+use rustc_target::spec::Os;
+
 use crate::concurrency::VClock;
 use crate::shims::files::{
     DynFileDescriptionRef, FdId, FdNum, FileDescription, FileDescriptionRef, WeakFileDescriptionRef,
@@ -410,15 +412,28 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Create a new [`Epoll`] instance.
     /// `flags` are the flags supported by the `epoll_create1` syscall.
     /// When `flags` is zero, this has the same semantics as `epoll_create`.
+    ///
+    /// When this function is called on a non linux-like target which doesn't
+    /// have an epoll system, only the zero `flags` is supported.
     fn create_epoll_instance(&mut self, flags: i32) -> InterpResult<'tcx, i32> {
         let this = self.eval_context_mut();
 
-        let epoll_cloexec = this.eval_libc_i32("EPOLL_CLOEXEC");
-
-        // Miri does not support exec, so EPOLL_CLOEXEC flag has no effect.
-        if flags != epoll_cloexec && flags != 0 {
-            throw_unsup_format!(
-                "epoll_create1: flag {flags:#x} is unsupported, only 0 or EPOLL_CLOEXEC are allowed",
+        // All platforms which support the epoll system support the epoll-specific constants.
+        // However, because other shims like `poll` are implemented using the epoll system,
+        // it can be that this function is also called for targets which don't have those
+        // constants and thus we need to have a target check here.
+        if matches!(this.tcx.sess.target.os, Os::Linux | Os::Android | Os::Solaris | Os::Illumos) {
+            let epoll_cloexec = this.eval_libc_i32("EPOLL_CLOEXEC");
+            // Miri does not support exec, so EPOLL_CLOEXEC flag has no effect.
+            if flags != epoll_cloexec && flags != 0 {
+                throw_unsup_format!(
+                    "epoll_create1: flag {flags:#x} is unsupported, only 0 or EPOLL_CLOEXEC are allowed",
+                );
+            }
+        } else if flags != 0 {
+            // On non-epoll targets we only support zero flags.
+            unreachable!(
+                "called `create_epoll_instance` on an non-epoll target with a non-zero flag"
             );
         }
 
