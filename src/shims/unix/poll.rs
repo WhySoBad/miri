@@ -3,9 +3,8 @@ use crate::*;
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// The `poll` shim is implemented using the epoll system because the epoll(7) man page states:
-    /// "[...] when used as a level-triggered interface (the default, when EPOLLET is not specified),
-    /// epoll is simply a faster poll(2) [...]".
+    /// The `poll` shim is implemented using the epoll system because the epoll(7) man page states that
+    /// "[...] when used as a level-triggered interface [...], epoll is simply a faster poll(2) [...]":
     /// <https://man7.org/linux/man-pages/man7/epoll.7.html>
     fn poll(
         &mut self,
@@ -22,18 +21,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let fds_arr_layout = this.libc_array_ty_layout("pollfd", nfds);
         let fds_arr_mplace = this.deref_pointer_as(fds, fds_arr_layout)?;
-        let mut fds = Vec::<(u64, MPlaceTy<'tcx>)>::new();
-
         let mut fds_arr_iter = this.project_array_fields(&fds_arr_mplace)?;
 
         let epfd_num = this.create_epoll_instance(/* flags */ 0)?;
-        let Some(epfd) = this.machine.fds.get(epfd_num) else {
-            return this.set_errno_and_return_neg1_i32(LibcError("EBADF"));
-        };
-        let epfd = epfd
+        let epfd = this
+            .machine
+            .fds
+            .get(epfd_num)
+            .expect("Newly created epoll file description should exist")
             .downcast::<Epoll>()
             .expect("Newly created epfd should be an epoll file description");
 
+        // We iterate over the poll's fds array and for each fd we add an interest to the `epfd`.
+        // Additionally, we store the fd identifier (stored in the epoll `data` field) together
+        // with the fd's `revents` field in the `fds` list such that we can later write back the
+        // poll readiness of the fd.
+        let mut fds = Vec::<(u64, MPlaceTy<'tcx>)>::new();
         while let Some((_idx, pollfd)) = fds_arr_iter.next(this)? {
             let fd_field = this.project_field_named(&pollfd, "fd")?;
             let fd_num = this.read_scalar(&fd_field)?.to_i32()?;
@@ -47,11 +50,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             let revents_field = this.project_field_named(&pollfd, "revents")?;
             // We initially zero every `revents` field because we later only
-            // update the `revents` fields for the FDs which received an event.
+            // update the `revents` fields for the fds which received an event.
             this.write_null(&revents_field)?;
 
             let data = u64::try_from(fd_num).unwrap();
-
             let result = this.register_epoll_interest(
                 &epfd,
                 /* reregister */ false,

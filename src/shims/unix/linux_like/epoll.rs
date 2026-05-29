@@ -389,7 +389,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     events: MPlaceTy<'tcx>,
                     dest: MPlaceTy<'tcx>
                 } |this, ready_events: Vec<(u32, u64)>| {
-                    let mut num_of_events = 0i32;
+                    let mut ready_count = 0i32;
                     let mut output_events_iter = this.project_array_fields(&events)?;
                     let mut ready_events_iter = ready_events.into_iter();
 
@@ -398,10 +398,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         && let Some((_idx, slot)) = output_events_iter.next(this)?
                     {
                         this.write_int_fields_named(&[("events", events.into()), ("u64", data.into())], &slot)?;
-                        num_of_events = num_of_events.strict_add(1);
+                        ready_count = ready_count.strict_add(1);
                     }
 
-                    this.write_scalar(Scalar::from_i32(num_of_events), &dest)
+                    this.write_scalar(Scalar::from_i32(ready_count), &dest)
                 }
             ),
         )
@@ -493,6 +493,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let id = fd.id();
         let epoll_key = (id, fd_num);
 
+        // FIXME: What does this comment mean? What do we reset on `EPOLL_CTL_MOD`?
+        // Experiments showed that we need to reset all state
+        // on `EPOLL_CTL_MOD`, including the edge tracking.
         if reregister {
             // The operation is `EPOLL_CTL_MOD`. We thus modify the existing interest.
             let Some(interest) = interest_list.get_mut(&epoll_key) else {
@@ -524,8 +527,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let active_events = fd.as_unix(this).epoll_active_events()?.get_event_bitmask(this);
 
         // Deliver events for the new interest.
-        // Experiments showed that we need to reset all state
-        // on `EPOLL_CTL_MOD`, including the edge tracking.
         this.update_readiness(epfd, active_events, /* force_edge */ true, move |callback| {
             // Need to release the `RefCell` when this closure returns, so we have to move
             // it into the closure, so we have to do a re-lookup here.
@@ -537,7 +538,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     /// Poll `epfd` using `epoll_wait` for at most `max_events` ready events
     /// with a timeout of `timeout`. The `finish` callback is called with
-    /// the amount of ready events. If the list is empty, the poll timed out.
+    /// the list of ready events. If the list is empty, the poll timed out.
     fn epoll_poll(
         &mut self,
         epfd: FileDescriptionRef<Epoll>,
@@ -589,7 +590,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             finish.call(this, events)
                         },
                         UnblockKind::TimedOut => {
-                            // Remove the current active thread_id from the blocked thread_id list.
+                            // Remove the current active thread id from the blocked threads list.
                             epfd.queue.borrow_mut().retain(|&id| id != this.active_thread());
                             finish.call(this, Vec::new())
                         },
@@ -734,6 +735,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
         }
 
+        // We return at most `max_events` ready events. If there are currently
+        // less ready events, we return a shorter list with all ready events.
         let events_len = u64::try_from(ready_events.len()).unwrap().min(max_events);
         let events = (0..events_len)
             .map(|_| {
