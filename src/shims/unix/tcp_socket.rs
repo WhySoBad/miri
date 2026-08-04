@@ -19,11 +19,9 @@ use crate::*;
 enum SocketState {
     /// No syscall after `socket` has been made.
     Initial,
-    /// The `bind` syscall has been called on the socket.
-    /// This is only reachable from the [`SocketState::Initial`] state.
-    Bound(socket2::SockAddr),
     /// The `listen` syscall has been called on the socket.
-    /// This is only reachable from the [`SocketState::Bound`] state.
+    /// This is only reachable when the socket is also bound
+    /// to an address.
     Listening,
     /// The `connect` syscall has been called and we weren't yet able
     /// to ensure the connection is established. This is only reachable
@@ -55,6 +53,10 @@ pub(super) struct TcpSocket {
     state: RefCell<SocketState>,
     /// Whether this fd is non-blocking or not.
     is_non_block: Cell<bool>,
+    /// Whether the socket is bound to an address. [`true`] when the socket is either explicitly
+    /// bound using a `bind` invocation, or implicitly using a `listen` invocation or by being
+    /// connected to a peer socket.
+    is_bound: Cell<bool>,
     /// The current blocking I/O readiness of the file description.
     io_readiness: RefCell<Readiness>,
     /// [`Some`] when the socket had an async error which has not yet been fetched via `SO_ERROR`.
@@ -87,6 +89,7 @@ impl TcpSocket {
             family,
             state: RefCell::new(SocketState::Initial),
             is_non_block: Cell::new(is_non_block),
+            is_bound: Cell::new(false),
             io_readiness: RefCell::new(Readiness::EMPTY),
             error: RefCell::new(None),
             read_timeout: Cell::new(None),
@@ -244,44 +247,31 @@ impl UnixSocketFileDescription for TcpSocket {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
         ecx.ensure_not_failed(&self, "bind")?;
 
-        let mut state = self.state.borrow_mut();
-
-        // TODO: This should be possible from all socket states.
-        match *state {
-            SocketState::Initial => {
-                if self.family != address.domain() {
-                    // Attempted to bind an address from a family that doesn't match
-                    // the family of the socket.
-                    let err = if matches!(ecx.tcx.sess.target.os, Os::Linux | Os::Android) {
-                        // Linux man page states that `EINVAL` is used when there is an address family mismatch.
-                        // See <https://man7.org/linux/man-pages/man2/bind.2.html>
-                        LibcError("EINVAL")
-                    } else {
-                        // POSIX man page states that `EAFNOSUPPORT` should be used when there is an address
-                        // family mismatch.
-                        // See <https://man7.org/linux/man-pages/man3/bind.3p.html>
-                        LibcError("EAFNOSUPPORT")
-                    };
-                    return interp_ok(Err(err));
-                }
-
-                if let Err(e) = self.inner.borrow().bind(&address) {
-                    return interp_ok(Err(IoError::HostError(e)));
-                }
-                *state = SocketState::Bound(address);
-            }
-            SocketState::Connecting | SocketState::Connected =>
-                throw_unsup_format!(
-                    "bind: tcp socket is already connected and binding a
-                   connected socket is unsupported"
-                ),
-            SocketState::Bound(_) | SocketState::Listening =>
-                throw_unsup_format!(
-                    "bind: tcp socket is already bound and binding a socket \
-                   multiple times is unsupported"
-                ),
-            SocketState::ConnectionFailed => unreachable!(),
+        if self.is_bound.get() {
+            // POSIX specifies returning EINVAL when the socket is already bound.
+            return interp_ok(Err(LibcError("EINVAL")));
         }
+
+        if self.family != address.domain() {
+            // Attempted to bind an address from a family that doesn't match
+            // the family of the socket.
+            let err = if matches!(ecx.tcx.sess.target.os, Os::Linux | Os::Android) {
+                // Linux man page states that `EINVAL` is used when there is an address family mismatch.
+                // See <https://man7.org/linux/man-pages/man2/bind.2.html>
+                LibcError("EINVAL")
+            } else {
+                // POSIX man page states that `EAFNOSUPPORT` should be used when there is an address
+                // family mismatch.
+                // See <https://man7.org/linux/man-pages/man3/bind.3p.html>
+                LibcError("EAFNOSUPPORT")
+            };
+            return interp_ok(Err(err));
+        }
+
+        if let Err(e) = self.inner.borrow().bind(&address) {
+            return interp_ok(Err(IoError::HostError(e)));
+        }
+        self.is_bound.set(true);
 
         interp_ok(Ok(()))
     }
@@ -297,44 +287,35 @@ impl UnixSocketFileDescription for TcpSocket {
 
         let mut state = self.state.borrow_mut();
 
-        // TODO: This should be possible from all socket states.
-        match &*state {
-            SocketState::Bound(_socket_addr) => {
-                let inner = self.inner.borrow();
-                match inner.listen(backlog) {
-                    Ok(()) => *state = SocketState::Listening,
-                    Err(e) => return interp_ok(Err(IoError::HostError(e))),
-                }
-
-                // After starting to listen, the (E)POLLHUP and (E)POLLOUT readiness are
-                // no longer set for the socket. For our readiness system this means that
-                // the read- and write-closed, and writable readiness are no longer set.
-                // See <https://github.com/torvalds/linux/blob/980a813/net/ipv4/inet_connection_sock.c#L1341>,
-                // and <https://github.com/torvalds/linux/blob/980a813/include/net/inet_connection_sock.h#L307-L308>
-                let mut readiness = self.io_readiness.borrow_mut();
-                readiness.write_closed = false;
-                readiness.read_closed = false;
-                readiness.writable = false;
-
-                drop(readiness);
-
-                ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
-            }
-            SocketState::Initial => {
-                throw_unsup_format!(
-                    "listen: listening on a tcp socket which isn't bound is unsupported"
-                )
-            }
-            SocketState::Listening => {
-                throw_unsup_format!(
-                    "listen: listening on a tcp socket multiple times is unsupported"
-                )
-            }
-            SocketState::Connecting | SocketState::Connected => {
-                throw_unsup_format!("listen: listening on a connected tcp socket is unsupported")
-            }
-            SocketState::ConnectionFailed => unreachable!(),
+        if matches!(*state, SocketState::Connecting | SocketState::Connected) {
+            // POSIX specifies to return EINVAL when `listen` is called on connected sockets.
+            return interp_ok(Err(LibcError("EINVAL")));
         }
+
+        let inner = self.inner.borrow();
+        match inner.listen(backlog) {
+            Ok(()) => {
+                *state = SocketState::Listening;
+                // Invoking `listen` on a socket implicitly binds it to a local address
+                // should it not be bound already.
+                self.is_bound.set(true);
+            }
+            Err(e) => return interp_ok(Err(IoError::HostError(e))),
+        }
+
+        // After starting to listen, the (E)POLLHUP and (E)POLLOUT readiness are
+        // no longer set for the socket. For our readiness system this means that
+        // the read- and write-closed, and writable readiness can be removed.
+        // See <https://github.com/torvalds/linux/blob/980a813/net/ipv4/inet_connection_sock.c#L1341>,
+        // and <https://github.com/torvalds/linux/blob/980a813/include/net/inet_connection_sock.h#L307-L308>
+        let mut readiness = self.io_readiness.borrow_mut();
+        readiness.write_closed = false;
+        readiness.read_closed = false;
+        readiness.writable = false;
+
+        drop(readiness);
+
+        ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
 
         interp_ok(Ok(()))
     }
@@ -412,10 +393,12 @@ impl UnixSocketFileDescription for TcpSocket {
         if result.is_ok() || result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::InProgress) {
             self.state.replace(SocketState::Connecting);
         }
+        // After initializing a connection the socket gets implicitly bound to a local address.
+        self.is_bound.set(true);
 
         // After initializing the connection, the (E)POLLHUP and (E)POLLOUT readiness
         // are no longer set for the socket. For our readiness system this means that
-        // the read- and write-closed, and writable readiness are no longer set.
+        // the read- and write-closed, and writable readiness can be removed.
         // See <https://github.com/torvalds/linux/blob/980a813/net/ipv4/tcp_ipv4.c#L305>,
         // and <https://github.com/torvalds/linux/blob/980a813/net/ipv4/tcp.c#L581-L587>
         let mut readiness = self.io_readiness.borrow_mut();
@@ -655,7 +638,7 @@ impl UnixSocketFileDescription for TcpSocket {
 
                 // TODO: This should be possible from all socket states.
                 let result = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) =>
+                    SocketState::Initial =>
                         throw_unsup_format!(
                             "setsockopt: setting option IP_TTL on level IPPROTO_IP is only supported \
                            on connected and listening tcp sockets"
@@ -687,7 +670,7 @@ impl UnixSocketFileDescription for TcpSocket {
 
                 // TODO: This should be possible from all socket states.
                 let result = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) | SocketState::Listening =>
+                    SocketState::Initial | SocketState::Listening =>
                         throw_unsup_format!(
                             "setsockopt: setting option TCP_NODELAY on level IPPROTO_TCP is only supported \
                            on connected tcp sockets"
@@ -781,7 +764,7 @@ impl UnixSocketFileDescription for TcpSocket {
             if option == opt_ip_ttl {
                 // TODO: This should be possible from all socket states.
                 let ttl = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) =>
+                    SocketState::Initial =>
                         throw_unsup_format!(
                             "getsockopt: reading option IP_TTL on level IPPROTO_IP is only supported \
                             on connected and listening tcp sockets"
@@ -811,7 +794,7 @@ impl UnixSocketFileDescription for TcpSocket {
             if option == opt_tcp_nodelay {
                 // TODO: This should be possible from all socket states.
                 let nodelay = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) | SocketState::Listening =>
+                    SocketState::Initial | SocketState::Listening =>
                         throw_unsup_format!(
                             "getsockopt: reading option TCP_NODELAY on level IPPROTO_TCP is only supported \
                             on connected tcp sockets"
@@ -853,52 +836,36 @@ impl UnixSocketFileDescription for TcpSocket {
 
         let state = self.state.borrow();
 
-        // TODO: This should be possible from all socket states.
-        let address = match &*state {
-            SocketState::Bound(address) => {
-                if address.as_socket().unwrap().port() == 0 {
-                    // The socket is bound to a zero-port which means it gets assigned a random
-                    // port. Since we don't yet have an underlying socket, we don't know what this
-                    // random port will be and thus this is unsupported.
-                    throw_unsup_format!(
-                        "getsockname: when the port is 0, getting the tcp socket address before \
-                        calling `listen` or `connect` is unsupported"
-                    )
-                }
+        if !self.is_bound.get() {
+            // The socket is neither implicitly nor explicitly bound to an address. For non-bound sockets
+            // the POSIX manual says the returned address is unspecified. Often this is 0.0.0.0:0 and thus
+            // we set it to this value.
+            let address = socket2::SockAddr::from(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                0,
+            )));
+            return interp_ok(Ok(address));
+        }
 
-                address.clone()
+        // The host socket is implicitly or explicitly bound to an address.
+
+        if cfg!(windows) && matches!(*state, SocketState::Connecting) {
+            // FIXME: On Windows hosts `Socket::local_addr` returns `0.0.0.0:0` whilst
+            // the socket is connecting:
+            // <https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-getsockname#remarks>
+            // This is problematic because UNIX targets could expect a real local address even
+            // for a connecting non-blocking socket.
+
+            static DEDUP: AtomicBool = AtomicBool::new(false);
+            if !DEDUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                ecx.emit_diagnostic(NonHaltingDiagnostic::ConnectingSocketGetsockname);
             }
-            SocketState::Listening =>
-                match self.inner.borrow().local_addr() {
-                    Ok(address) => address,
-                    Err(e) => return interp_ok(Err(IoError::HostError(e))),
-                },
-            SocketState::Connecting | SocketState::Connected => {
-                if cfg!(windows) && matches!(&*state, SocketState::Connecting) {
-                    // FIXME: On Windows hosts `TcpStream::local_addr` returns `0.0.0.0:0` whilst
-                    // the socket is connecting:
-                    // <https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-getsockname#remarks>
-                    // This is problematic because UNIX targets could expect a real local address even
-                    // for a connecting non-blocking socket.
+        }
 
-                    static DEDUP: AtomicBool = AtomicBool::new(false);
-                    if !DEDUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        ecx.emit_diagnostic(NonHaltingDiagnostic::ConnectingSocketGetsockname);
-                    }
-                }
-                match self.inner.borrow().local_addr() {
-                    Ok(address) => address,
-                    Err(e) => return interp_ok(Err(IoError::HostError(e))),
-                }
-            }
-            // For non-bound sockets the POSIX manual says the returned address is unspecified.
-            // Often this is 0.0.0.0:0 and thus we set it to this value.
-            SocketState::Initial =>
-                socket2::SockAddr::from(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
-            SocketState::ConnectionFailed => unreachable!(),
-        };
-
-        interp_ok(Ok(address))
+        match self.inner.borrow().local_addr() {
+            Ok(address) => interp_ok(Ok(address)),
+            Err(e) => interp_ok(Err(IoError::HostError(e))),
+        }
     }
 
     fn getpeername<'tcx>(
@@ -910,7 +877,7 @@ impl UnixSocketFileDescription for TcpSocket {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
 
         let socket = self;
-        // It's only safe to call [`TcpStream::peer_addr`] after the socket is connected since
+        // It's only safe to call [`Socket::peer_addr`] after the socket is connected since
         // UNIX targets should return ENOTCONN when the connection is not yet established.
         ecx.ensure_connected(
             socket.clone(),
@@ -1095,6 +1062,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             family: addr.domain(),
             state: RefCell::new(SocketState::Connected),
             is_non_block: Cell::new(is_client_sock_nonblock),
+            is_bound: Cell::new(true),
             io_readiness: RefCell::new(Readiness::EMPTY),
             error: RefCell::new(None),
             read_timeout: Cell::new(None),
@@ -1497,7 +1465,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     //
                     // Attempting to read the peer address would introduce an edge-case where the
                     // write end of the socket could already be shutdown before it received a
-                    // writable event. When we then call [`TcpStream::peer_addr`] we receive an
+                    // writable event. When we then call [`Socket::peer_addr`] we receive an
                     // error. This would need extra state for storing whether the write end was
                     // manually closed using `shutdown`.
                     // Also, tokio doesn't read the peer address and everything seems to be fine,
@@ -1546,7 +1514,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let new_error = match &*state {
             SocketState::Listening | SocketState::Connecting | SocketState::Connected =>
                 socket.inner.borrow().take_error().expect("Reading SO_ERROR should not fail"),
-            SocketState::Initial | SocketState::Bound(_) | SocketState::ConnectionFailed => None,
+            SocketState::Initial | SocketState::ConnectionFailed => None,
         };
 
         let Some(new_error) = new_error else { return };
