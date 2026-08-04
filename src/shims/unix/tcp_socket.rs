@@ -305,6 +305,20 @@ impl UnixSocketFileDescription for TcpSocket {
                     Ok(()) => *state = SocketState::Listening,
                     Err(e) => return interp_ok(Err(IoError::HostError(e))),
                 }
+
+                // After starting to listen, the (E)POLLHUP and (E)POLLOUT readiness are
+                // no longer set for the socket. For our readiness system this means that
+                // the read- and write-closed, and writable readiness are no longer set.
+                // See <https://github.com/torvalds/linux/blob/980a813/net/ipv4/inet_connection_sock.c#L1341>,
+                // and <https://github.com/torvalds/linux/blob/980a813/include/net/inet_connection_sock.h#L307-L308>
+                let mut readiness = self.io_readiness.borrow_mut();
+                readiness.write_closed = false;
+                readiness.read_closed = false;
+                readiness.writable = false;
+
+                drop(readiness);
+
+                ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
             }
             SocketState::Initial => {
                 throw_unsup_format!(
@@ -394,13 +408,32 @@ impl UnixSocketFileDescription for TcpSocket {
         // We deal with that below.
         // FIXME: Windows doesn't allow setting socket options while connecting; see [`socket2::Socket::connect`]
         // doc comment.
-        match self.inner.borrow().connect(&address) {
-            Ok(()) => *self.state.borrow_mut() = SocketState::Connecting,
+        let result = self.inner.borrow().connect(&address);
+        if result.is_ok() || result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::InProgress) {
+            self.state.replace(SocketState::Connecting);
+        }
+
+        // After initializing the connection, the (E)POLLHUP and (E)POLLOUT readiness
+        // are no longer set for the socket. For our readiness system this means that
+        // the read- and write-closed, and writable readiness are no longer set.
+        // See <https://github.com/torvalds/linux/blob/980a813/net/ipv4/tcp_ipv4.c#L305>,
+        // and <https://github.com/torvalds/linux/blob/980a813/net/ipv4/tcp.c#L581-L587>
+        let mut readiness = self.io_readiness.borrow_mut();
+        readiness.write_closed = false;
+        readiness.read_closed = false;
+        readiness.writable = false;
+
+        drop(readiness);
+
+        ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
+
+        match result {
+            Ok(()) => { /* fall-through to below */ }
             // For blocking sockets EINPROGRESS is ignored.
-            Err(e) if e.kind() == io::ErrorKind::InProgress && !self.is_non_block.get() =>
-                *self.state.borrow_mut() = SocketState::Connecting,
+            Err(e) if e.kind() == io::ErrorKind::InProgress && !self.is_non_block.get() => { /* fall-through to below */
+            }
             Err(e) => return finish.call(ecx, Err(IoError::HostError(e))),
-        };
+        }
 
         if self.is_non_block.get() {
             // We have a non-blocking socket and thus don't want to block until
