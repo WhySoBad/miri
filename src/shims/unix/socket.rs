@@ -221,8 +221,19 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         }
 
+        let socket = match TcpSocket::new(family, is_non_block) {
+            Ok(socket) => socket,
+            Err(e) => return this.set_errno_and_return_neg1_i32(e),
+        };
         let fds = &mut this.machine.fds;
-        let fd = fds.new_ref(TcpSocket::new(family, is_non_block));
+        let fd = fds.new_ref(socket);
+
+        // TCP sockets are implemented using host sockets. They thus need
+        // to be registered to the blocking I/O manager directly after creation.
+        // FIXME: This is problematic since (E)POLLHUP is initially set for a socket;
+        // we need to clear the flags after dispatching a non-blocking `connect`, this is
+        // also what Linux does.
+        this.machine.blocking_io.register(fd.clone());
 
         interp_ok(Scalar::from_i32(fds.insert(fd)))
     }

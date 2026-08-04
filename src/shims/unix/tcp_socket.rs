@@ -47,6 +47,8 @@ enum SocketState {
 
 #[derive(Debug)]
 pub(super) struct TcpSocket {
+    /// Underlying host socket on which operations are performed.
+    inner: RefCell<socket2::Socket>,
     /// Family of the socket, used to ensure socket only binds/connects to address of
     /// same family.
     family: socket2::Domain,
@@ -75,8 +77,14 @@ pub(super) struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(family: socket2::Domain, is_non_block: bool) -> Self {
-        TcpSocket {
+    pub fn new(family: socket2::Domain, is_non_block: bool) -> io::Result<Self> {
+        let inner = socket2::Socket::new(family, socket2::Type::STREAM, None)?;
+        // The underlying host socket always needs to be non-blocking. The actual blocking
+        // mode of the socket is stored in `is_non_block`.
+        inner.set_nonblocking(true)?;
+
+        Ok(TcpSocket {
+            inner: RefCell::new(inner),
             family,
             state: RefCell::new(SocketState::Initial),
             is_non_block: Cell::new(is_non_block),
@@ -85,7 +93,7 @@ impl TcpSocket {
             read_timeout: Cell::new(None),
             write_timeout: Cell::new(None),
             watched: ReadinessWatched::default(),
-        }
+        })
     }
 }
 
@@ -1022,14 +1030,11 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         let state = socket.state.borrow();
-        let SocketState::Listening(listener) = &*state else {
-            panic!(
-                "try_non_block_accept must only be called when socket is in `SocketState::Listening`"
-            )
-        };
+        // TODO: Check whether Windows `accept` semantics differ from POSIX.
+        assert!(matches!(&*state, SocketState::Listening(_)), "try_non_block_accept must only be called when socket is in `SocketState::Listening`");
 
-        let (stream, addr) = match listener.accept() {
-            Ok((stream, addr)) => (stream, socket2::SockAddr::from(addr)),
+        let (peer_socket, addr) = match socket.inner.borrow().accept() {
+            Ok(peer) => peer,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // We know that the source is not readable so we need to update its readiness.
                 socket.io_readiness.borrow_mut().readable = false;
@@ -1040,9 +1045,17 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             Err(e) => return interp_ok(Err(IoError::HostError(e))),
         };
 
+        // The underlying host socket always needs to be non-blocking. The actual blocking
+        // mode of the socket is stored in `is_non_block`.
+        if let Err(e) = peer_socket.set_nonblocking(true) {
+            // FIXME: Is it correct to simply forward the error here? We maybe want to just unwrap.
+            return interp_ok(Err(IoError::HostError(e)))
+        };
+
         let fd = this.machine.fds.new_ref(TcpSocket {
+            inner: RefCell::new(peer_socket),
             family: addr.domain(),
-            state: RefCell::new(SocketState::Connected(stream)),
+            state: RefCell::new(SocketState::Connected(todo!("we no longer have `TcpStream`"))),
             is_non_block: Cell::new(is_client_sock_nonblock),
             io_readiness: RefCell::new(Readiness::EMPTY),
             error: RefCell::new(None),
@@ -1517,15 +1530,24 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
 impl SourceFileDescription for TcpSocket {
     fn with_source(&self, f: &mut dyn FnMut(&mut dyn Source) -> io::Result<()>) -> io::Result<()> {
-        let mut state = self.state.borrow_mut();
-        match &mut *state {
-            SocketState::Listening(listener) => f(listener),
-            SocketState::Connecting(stream)
-            | SocketState::Connected(stream)
-            | SocketState::ConnectionFailed(stream) => f(stream),
-            // We never try adding a socket which is not backed by a real socket to the poll registry.
-            _ => unreachable!(),
-        }
+        // Temporarily wrap the underlying socket into a `mio::TcpStream` for which `Source` is implemented.
+        #[rustfmt::skip] // Rustfmt tries to remove the outer braces of {{ .. }} which makes it invalid Rust syntax.
+        let stream = cfg_select! {
+            unix => {{
+                use std::os::fd::{AsRawFd, FromRawFd};
+                let raw_fd = self.inner.borrow().as_raw_fd();
+                unsafe { mio::net::TcpStream::from_raw_fd(raw_fd) }
+            }},
+            windows => {{
+                use std::os::windows::io::{AsRawSocket, FromRawSocket};
+                let raw_socket = self.inner.borrow().as_raw_socket();
+                unsafe { mio::net::TcpStream::from_raw_socket(raw_socket) }
+            }},
+            _ => panic!("unsupported host platform"),
+        };
+        // Prevent closing the underlying socket when `stream` is dropped.
+        let mut stream = std::mem::ManuallyDrop::new(stream);
+        f(&mut *stream)
     }
 
     fn get_readiness_mut(&self) -> RefMut<'_, Readiness> {
