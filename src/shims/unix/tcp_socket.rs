@@ -13,7 +13,7 @@ use rustc_target::spec::Os;
 
 use crate::shims::files::{EvalContextExt as _, FdNum, FileDescription, FileDescriptionRef};
 use crate::shims::unix::UnixFileDescription;
-use crate::shims::unix::socket::{SocketFamily, UnixSocketFileDescription};
+use crate::shims::unix::socket::UnixSocketFileDescription;
 use crate::*;
 
 #[derive(Debug)]
@@ -22,7 +22,7 @@ enum SocketState {
     Initial,
     /// The `bind` syscall has been called on the socket.
     /// This is only reachable from the [`SocketState::Initial`] state.
-    Bound(SocketAddr),
+    Bound(socket2::SockAddr),
     /// The `listen` syscall has been called on the socket.
     /// This is only reachable from the [`SocketState::Bound`] state.
     Listening(TcpListener),
@@ -49,7 +49,7 @@ enum SocketState {
 pub(super) struct TcpSocket {
     /// Family of the socket, used to ensure socket only binds/connects to address of
     /// same family.
-    family: SocketFamily,
+    family: socket2::Domain,
     /// Current state of the inner socket.
     state: RefCell<SocketState>,
     /// Whether this fd is non-blocking or not.
@@ -75,7 +75,7 @@ pub(super) struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(family: SocketFamily, is_non_block: bool) -> Self {
+    pub fn new(family: socket2::Domain, is_non_block: bool) -> Self {
         TcpSocket {
             family,
             state: RefCell::new(SocketState::Initial),
@@ -231,7 +231,7 @@ impl UnixSocketFileDescription for TcpSocket {
     fn bind<'tcx>(
         self: FileDescriptionRef<TcpSocket>,
         communicate_allowed: bool,
-        address: SocketAddr,
+        address: socket2::SockAddr,
         ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, Result<(), IoError>> {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
@@ -241,12 +241,7 @@ impl UnixSocketFileDescription for TcpSocket {
 
         match *state {
             SocketState::Initial => {
-                let address_family = match &address {
-                    SocketAddr::V4(_) => SocketFamily::IPv4,
-                    SocketAddr::V6(_) => SocketFamily::IPv6,
-                };
-
-                if self.family != address_family {
+                if self.family != address.domain() {
                     // Attempted to bind an address from a family that doesn't match
                     // the family of the socket.
                     let err = if matches!(ecx.tcx.sess.target.os, Os::Linux | Os::Android) {
@@ -292,9 +287,9 @@ impl UnixSocketFileDescription for TcpSocket {
 
         let mut state = self.state.borrow_mut();
 
-        match *state {
+        match &*state {
             SocketState::Bound(socket_addr) =>
-                match TcpListener::bind(socket_addr) {
+                match TcpListener::bind(socket_addr.as_socket().unwrap()) {
                     Ok(listener) => {
                         *state = SocketState::Listening(listener);
                         drop(state);
@@ -328,7 +323,7 @@ impl UnixSocketFileDescription for TcpSocket {
         communicate_allowed: bool,
         is_client_sock_non_block: bool,
         ecx: &mut MiriInterpCx<'tcx>,
-        finish: DynMachineCallback<'tcx, Result<(FdNum, SocketAddr), IoError>>,
+        finish: DynMachineCallback<'tcx, Result<(FdNum, socket2::SockAddr), IoError>>,
     ) -> InterpResult<'tcx> {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
 
@@ -364,7 +359,7 @@ impl UnixSocketFileDescription for TcpSocket {
     fn connect<'tcx>(
         self: FileDescriptionRef<Self>,
         communicate_allowed: bool,
-        address: SocketAddr,
+        address: socket2::SockAddr,
         ecx: &mut MiriInterpCx<'tcx>,
         finish: DynMachineCallback<'tcx, Result<(), IoError>>,
     ) -> InterpResult<'tcx> {
@@ -387,7 +382,7 @@ impl UnixSocketFileDescription for TcpSocket {
 
         // This begins establishing the connection, but does not block until the stream is fully connected.
         // We deal with that below.
-        match TcpStream::connect(address) {
+        match TcpStream::connect(address.as_socket().unwrap()) {
             Ok(stream) => {
                 *self.state.borrow_mut() = SocketState::Connecting(stream);
                 // Register the socket to the blocking I/O manager because
@@ -807,7 +802,7 @@ impl UnixSocketFileDescription for TcpSocket {
         self: FileDescriptionRef<Self>,
         communicate_allowed: bool,
         ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, Result<SocketAddr, IoError>> {
+    ) -> InterpResult<'tcx, Result<socket2::SockAddr, IoError>> {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
         ecx.ensure_not_failed(&self, "getsockname")?;
 
@@ -815,7 +810,7 @@ impl UnixSocketFileDescription for TcpSocket {
 
         let address = match &*state {
             SocketState::Bound(address) => {
-                if address.port() == 0 {
+                if address.as_socket().unwrap().port() == 0 {
                     // The socket is bound to a zero-port which means it gets assigned a random
                     // port. Since we don't yet have an underlying socket, we don't know what this
                     // random port will be and thus this is unsupported.
@@ -825,11 +820,11 @@ impl UnixSocketFileDescription for TcpSocket {
                     )
                 }
 
-                *address
+                address.clone()
             }
             SocketState::Listening(listener) =>
                 match listener.local_addr() {
-                    Ok(address) => address,
+                    Ok(address) => socket2::SockAddr::from(address),
                     Err(e) => return interp_ok(Err(IoError::HostError(e))),
                 },
             SocketState::Connecting(stream) | SocketState::Connected(stream) => {
@@ -846,13 +841,14 @@ impl UnixSocketFileDescription for TcpSocket {
                     }
                 }
                 match stream.local_addr() {
-                    Ok(address) => address,
+                    Ok(address) => socket2::SockAddr::from(address),
                     Err(e) => return interp_ok(Err(IoError::HostError(e))),
                 }
             }
             // For non-bound sockets the POSIX manual says the returned address is unspecified.
             // Often this is 0.0.0.0:0 and thus we set it to this value.
-            SocketState::Initial => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            SocketState::Initial =>
+                socket2::SockAddr::from(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
             SocketState::ConnectionFailed(_) => unreachable!(),
         };
 
@@ -863,7 +859,7 @@ impl UnixSocketFileDescription for TcpSocket {
         self: FileDescriptionRef<Self>,
         communicate_allowed: bool,
         ecx: &mut MiriInterpCx<'tcx>,
-        finish: DynMachineCallback<'tcx, Result<SocketAddr, IoError>>,
+        finish: DynMachineCallback<'tcx, Result<socket2::SockAddr, IoError>>,
     ) -> InterpResult<'tcx> {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
 
@@ -878,7 +874,7 @@ impl UnixSocketFileDescription for TcpSocket {
             callback!(
                 @capture<'tcx> {
                     socket: FileDescriptionRef<TcpSocket>,
-                    finish: DynMachineCallback<'tcx, Result<SocketAddr, IoError>>,
+                    finish: DynMachineCallback<'tcx, Result<socket2::SockAddr, IoError>>,
                 } |this, result: Result<(), ()>| {
                     if result.is_err() {
                         return finish.call(this, Err(LibcError("ENOTCONN")))
@@ -888,7 +884,7 @@ impl UnixSocketFileDescription for TcpSocket {
                         unreachable!()
                     };
 
-                    let result = stream.peer_addr().map_err(IoError::HostError);
+                    let result = stream.peer_addr().map(socket2::SockAddr::from).map_err(IoError::HostError);
                     finish.call(this, result)
                 }
             ),
@@ -976,7 +972,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         socket: FileDescriptionRef<TcpSocket>,
         is_client_sock_nonblock: bool,
-        finish: DynMachineCallback<'tcx, Result<(FdNum, SocketAddr), IoError>>,
+        finish: DynMachineCallback<'tcx, Result<(FdNum, socket2::SockAddr), IoError>>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         // Since the callback holds a strong reference to the socket, the file description
@@ -989,7 +985,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             callback!(@capture<'tcx> {
                 socket: FileDescriptionRef<TcpSocket>,
                 is_client_sock_nonblock: bool,
-                finish: DynMachineCallback<'tcx, Result<(FdNum, SocketAddr), IoError>>,
+                finish: DynMachineCallback<'tcx, Result<(FdNum, socket2::SockAddr), IoError>>,
             } |this, kind: UnblockKind| {
                 // Remove the blocking I/O interest for unblocking this thread.
                 this.machine.blocking_io.remove_blocked_thread(socket.id(), this.machine.threads.active_thread());
@@ -1022,7 +1018,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         socket: &FileDescriptionRef<TcpSocket>,
         is_client_sock_nonblock: bool,
-    ) -> InterpResult<'tcx, Result<(FdNum, SocketAddr), IoError>> {
+    ) -> InterpResult<'tcx, Result<(FdNum, socket2::SockAddr), IoError>> {
         let this = self.eval_context_mut();
 
         let state = socket.state.borrow();
@@ -1033,7 +1029,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         let (stream, addr) = match listener.accept() {
-            Ok(peer) => peer,
+            Ok((stream, addr)) => (stream, socket2::SockAddr::from(addr)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // We know that the source is not readable so we need to update its readiness.
                 socket.io_readiness.borrow_mut().readable = false;
@@ -1044,13 +1040,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             Err(e) => return interp_ok(Err(IoError::HostError(e))),
         };
 
-        let family = match addr {
-            SocketAddr::V4(_) => SocketFamily::IPv4,
-            SocketAddr::V6(_) => SocketFamily::IPv6,
-        };
-
         let fd = this.machine.fds.new_ref(TcpSocket {
-            family,
+            family: addr.domain(),
             state: RefCell::new(SocketState::Connected(stream)),
             is_non_block: Cell::new(is_client_sock_nonblock),
             io_readiness: RefCell::new(Readiness::EMPTY),

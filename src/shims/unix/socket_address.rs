@@ -131,7 +131,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         address: &OpTy<'tcx>,
         address_len: &OpTy<'tcx>,
         foreign_name: &'static str,
-    ) -> InterpResult<'tcx, Result<SocketAddr, IoError>> {
+    ) -> InterpResult<'tcx, Result<socket2::SockAddr, IoError>> {
         let this = self.eval_context_ref();
 
         let socklen_layout = this.libc_ty_layout("socklen_t");
@@ -225,15 +225,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 scope_id,
             ))
         } else {
-            // Socket of other types shouldn't be created in a first place and
-            // thus also no address family of another type should be supported.
+            // At the moment only IP addresses are supported.
             throw_unsup_format!(
                 "{foreign_name}: address family {family:#x} is unsupported, \
                 only AF_INET and AF_INET6 are allowed"
             );
         };
 
-        interp_ok(Ok(socket_addr))
+        interp_ok(Ok(socket2::SockAddr::from(socket_addr)))
     }
 
     /// Attempt to write a standard library socket address into a pointer.
@@ -247,7 +246,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// overflow the buffer.
     fn write_socket_address(
         &mut self,
-        address: &SocketAddr,
+        address: &socket2::SockAddr,
         address_ptr: Pointer,
         address_len_ptr: Pointer,
         foreign_name: &'static str,
@@ -272,8 +271,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             .try_into()
             .unwrap();
 
-        let address_buffer = match address {
-            SocketAddr::V4(address) => {
+        let address_buffer = match address.as_socket() {
+            Some(SocketAddr::V4(address)) => {
                 // IPv4 address bytes; already stored in network byte order.
                 let address_bytes = address.ip().octets();
                 // Port needs to be manually turned into network byte order.
@@ -312,7 +311,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
                 address_buffer
             }
-            SocketAddr::V6(address) => {
+            Some(SocketAddr::V6(address)) => {
                 // IPv6 address bytes; already stored in network byte order.
                 let address_bytes = address.ip().octets();
                 // Port needs to be manually turned into network byte order.
@@ -364,6 +363,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_bytes_ptr(s6_addr_field.ptr(), address_bytes)?;
 
                 address_buffer
+            }
+            None => {
+                // At the moment only IP addresses are supported.
+                throw_unsup_format!(
+                    "{foreign_name}: address family {:#x} is unsupported, \
+                    only AF_INET and AF_INET6 are allowed",
+                    address.family()
+                );
             }
         };
 
@@ -453,7 +460,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             iter::repeat_n(0, sockaddr_mplace.layout.size.bytes_usize()),
         )?;
         this.write_socket_address(
-            &address,
+            &socket2::SockAddr::from(address),
             sockaddr_mplace.ptr(),
             addrlen_mplace.ptr(),
             "getaddrinfo",
