@@ -15,6 +15,15 @@ use crate::shims::unix::UnixFileDescription;
 use crate::shims::unix::socket::UnixSocketFileDescription;
 use crate::*;
 
+/// On Linux the socket is initially in TCP_CLOSE where (E)POLLHUP is reported.
+/// Furthermore, initially the write buffer is also empty, so (E)POLLOUT is
+/// reported as well. These events map to "read closed", "write closed" and
+/// "writable" of our generic [`Readiness`] struct.
+/// Because Windows IOCP don't report any readiness for a newly created socket,
+/// we need to set the default readiness manually.
+const DEFAULT_TCP_SOCKET_READINESS: Readiness =
+    Readiness { writable: true, read_closed: true, write_closed: true, ..Readiness::EMPTY };
+
 #[derive(Debug)]
 enum SocketState {
     /// No syscall after `socket` has been made.
@@ -90,7 +99,7 @@ impl TcpSocket {
             state: RefCell::new(SocketState::Initial),
             is_non_block: Cell::new(is_non_block),
             is_bound: Cell::new(false),
-            io_readiness: RefCell::new(Readiness::EMPTY),
+            io_readiness: RefCell::new(DEFAULT_TCP_SOCKET_READINESS),
             error: RefCell::new(None),
             read_timeout: Cell::new(None),
             write_timeout: Cell::new(None),
@@ -390,9 +399,24 @@ impl UnixSocketFileDescription for TcpSocket {
         // FIXME: Windows doesn't allow setting socket options while connecting; see [`socket2::Socket::connect`]
         // doc comment.
         let result = self.inner.borrow().connect(&address);
-        if result.is_ok() || result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::InProgress) {
-            self.state.replace(SocketState::Connecting);
+        let is_in_progress = result.as_ref().is_err_and(|e| {
+            if cfg!(windows) {
+                // On Windows hosts non-blocking connects fail with EWOULDBLOCK when the connection
+                // cannot be established immediately.
+                e.kind() == io::ErrorKind::WouldBlock
+            } else {
+                // On Unix-like hosts non-blocking connects fail with EINPROGRESS when the connection
+                // cannot be established immediately.
+                e.kind() == io::ErrorKind::InProgress
+            }
+        });
+        if let Err(e) = result
+            && !is_in_progress
+        {
+            return finish.call(ecx, Err(IoError::HostError(e)));
         }
+
+        self.state.replace(SocketState::Connecting);
         // After initializing a connection the socket gets implicitly bound to a local address.
         self.is_bound.set(true);
 
@@ -410,12 +434,13 @@ impl UnixSocketFileDescription for TcpSocket {
 
         ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
 
-        match result {
-            Ok(()) => { /* fall-through to below */ }
-            // For blocking sockets EINPROGRESS is ignored.
-            Err(e) if e.kind() == io::ErrorKind::InProgress && !self.is_non_block.get() => { /* fall-through to below */
-            }
-            Err(e) => return finish.call(ecx, Err(IoError::HostError(e))),
+        // For non-blocking sockets EINPROGRESS and EWOULDBLOCK are mapped to
+        // EINPROGRESS and returned. For blocking sockets we ignore them and
+        // block until the connection is established.
+        if is_in_progress && self.is_non_block.get() {
+            // The socket is non-blocking and `Socket::connect` returned
+            // EINPROGRESS or EWOULDBLOCK.
+            return finish.call(ecx, Err(LibcError("EINPROGRESS")));
         }
 
         if self.is_non_block.get() {
