@@ -221,8 +221,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         }
 
+        let socket = match TcpSocket::new(family, is_non_block) {
+            Ok(socket) => socket,
+            Err(e) => return this.set_errno_and_return_neg1_i32(e),
+        };
         let fds = &mut this.machine.fds;
-        let fd = fds.new_ref(TcpSocket::new(family, is_non_block));
+        let fd = fds.new_ref(socket);
 
         interp_ok(Scalar::from_i32(fds.insert(fd)))
     }
