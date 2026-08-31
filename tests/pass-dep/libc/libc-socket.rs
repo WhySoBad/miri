@@ -32,8 +32,12 @@ fn main() {
         test_set_nosigpipe_invalid_len();
     }
     test_bind_ipv4_invalid_addr_len();
+    test_bind_ipv4_client_sock();
+    test_bind_ipv4_multiple_times();
     test_bind_ipv6();
     test_listen();
+    test_listen_multiple_times();
+    test_listen_without_bind();
 
     test_accept_connect();
     test_connect_error();
@@ -223,6 +227,67 @@ fn test_bind_ipv4_invalid_addr_len() {
     }
 }
 
+/// Test explicitly binding an IPv4 socket to an address before calling
+/// `connect` and ensure that `getsockname` returns the same address
+/// before and after calling `connect`.
+fn test_bind_ipv4_client_sock() {
+    let (server_sockfd, addr) = net::make_listener_ipv4().unwrap();
+    let client_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    let client_addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
+    unsafe {
+        errno_check(libc::bind(
+            client_sockfd,
+            (&client_addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ));
+    }
+
+    let (_, client_addr) = net::sockname_ipv4(|storage, len| unsafe {
+        libc::getsockname(client_sockfd, storage, len)
+    })
+    .unwrap();
+
+    net::connect_ipv4(client_sockfd, addr).unwrap();
+    net::accept_ipv4(server_sockfd).unwrap();
+
+    // The socket should still be bound to the same local address it was bound
+    // to before calling `connect`.
+
+    let (_, sock_addr) = net::sockname_ipv4(|storage, len| unsafe {
+        libc::getsockname(client_sockfd, storage, len)
+    })
+    .unwrap();
+
+    assert_eq!(client_addr.sin_family, sock_addr.sin_family);
+    assert_eq!(client_addr.sin_port, sock_addr.sin_port);
+    assert_eq!(client_addr.sin_addr.s_addr, sock_addr.sin_addr.s_addr);
+}
+
+/// Test that binding a TCP socket multiple times returns EINVAL.
+fn test_bind_ipv4_multiple_times() {
+    let sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
+    let err = unsafe {
+        errno_check(libc::bind(
+            sockfd,
+            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ));
+        errno_result(libc::bind(
+            sockfd,
+            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ))
+        .unwrap_err()
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // Check that it is the right kind of `InvalidInput`.
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+}
+
 fn test_bind_ipv6() {
     let sockfd =
         unsafe { errno_result(libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0)).unwrap() };
@@ -251,6 +316,46 @@ fn test_listen() {
     unsafe {
         errno_check(libc::listen(sockfd, 16));
     }
+}
+
+/// Test that listening multiple times is supported.
+fn test_listen_multiple_times() {
+    let sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
+    unsafe {
+        errno_check(libc::bind(
+            sockfd,
+            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ));
+    }
+
+    unsafe {
+        errno_check(libc::listen(sockfd, 16));
+        errno_check(libc::listen(sockfd, 16));
+        errno_check(libc::listen(sockfd, 16));
+    }
+}
+
+/// Test that calling `listen` on a socket which is not bound
+/// to an address is supported.
+fn test_listen_without_bind() {
+    let sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    unsafe { errno_check(libc::listen(sockfd, 16)) };
+
+    // The socket should be implicitly bound to an address which is returned
+    // by `getsockname`.
+
+    let (_, sock_addr) =
+        net::sockname_ipv4(|storage, len| unsafe { libc::getsockname(sockfd, storage, len) })
+            .unwrap();
+
+    assert_eq!(libc::AF_INET as libc::sa_family_t, sock_addr.sin_family);
+    // The bound port must not be the zero port.
+    assert!(sock_addr.sin_port > 0);
 }
 
 /// Test accepting connections by running a server in a separate thread and connecting clients

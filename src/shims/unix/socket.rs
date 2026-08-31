@@ -1,4 +1,4 @@
-use std::net::{Shutdown, SocketAddr};
+use std::net::Shutdown;
 
 use rustc_abi::Size;
 use rustc_target::spec::Os;
@@ -10,14 +10,6 @@ use crate::shims::unix::socket_address::EvalContextExt as _;
 use crate::shims::unix::tcp_socket::TcpSocket;
 use crate::*;
 
-#[derive(Debug, PartialEq)]
-pub enum SocketFamily {
-    // IPv4 internet protocols
-    IPv4,
-    // IPv6 internet protocols
-    IPv6,
-}
-
 /// Represents unix-specific socket file descriptions.
 ///
 /// Not to be confused with Unix domain sockets.
@@ -26,7 +18,7 @@ pub trait UnixSocketFileDescription: UnixFileDescription {
     fn bind<'tcx>(
         self: FileDescriptionRef<Self>,
         _communicate_allowed: bool,
-        _address: SocketAddr,
+        _address: socket2::SockAddr,
         _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, Result<(), IoError>> {
         throw_unsup_format!("cannot bind {}", self.name());
@@ -54,7 +46,7 @@ pub trait UnixSocketFileDescription: UnixFileDescription {
         _communicate_allowed: bool,
         _is_client_sock_non_block: bool,
         _ecx: &mut MiriInterpCx<'tcx>,
-        _finish: DynMachineCallback<'tcx, Result<(FdNum, SocketAddr), IoError>>,
+        _finish: DynMachineCallback<'tcx, Result<(FdNum, socket2::SockAddr), IoError>>,
     ) -> InterpResult<'tcx> {
         throw_unsup_format!("cannot accept {}", self.name());
     }
@@ -63,7 +55,7 @@ pub trait UnixSocketFileDescription: UnixFileDescription {
     fn connect<'tcx>(
         self: FileDescriptionRef<Self>,
         _communicate_allowed: bool,
-        _address: SocketAddr,
+        _address: socket2::SockAddr,
         _ecx: &mut MiriInterpCx<'tcx>,
         _finish: DynMachineCallback<'tcx, Result<(), IoError>>,
     ) -> InterpResult<'tcx> {
@@ -134,7 +126,7 @@ pub trait UnixSocketFileDescription: UnixFileDescription {
         self: FileDescriptionRef<Self>,
         _communicate_allowed: bool,
         _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, Result<SocketAddr, IoError>> {
+    ) -> InterpResult<'tcx, Result<socket2::SockAddr, IoError>> {
         throw_unsup_format!("cannot get socket name for {}", self.name());
     }
 
@@ -143,7 +135,7 @@ pub trait UnixSocketFileDescription: UnixFileDescription {
         self: FileDescriptionRef<Self>,
         _communicate_allowed: bool,
         _ecx: &mut MiriInterpCx<'tcx>,
-        _finish: DynMachineCallback<'tcx, Result<SocketAddr, IoError>>,
+        _finish: DynMachineCallback<'tcx, Result<socket2::SockAddr, IoError>>,
     ) -> InterpResult<'tcx> {
         throw_unsup_format!("cannot get peer name for {}", self.name());
     }
@@ -204,9 +196,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
 
         let family = if domain == this.eval_libc_i32("AF_INET") {
-            SocketFamily::IPv4
+            socket2::Domain::IPV4
         } else if domain == this.eval_libc_i32("AF_INET6") {
-            SocketFamily::IPv6
+            socket2::Domain::IPV6
         } else {
             throw_unsup_format!(
                 "socket: domain {:#x} is unsupported, only AF_INET and \
@@ -229,8 +221,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         }
 
+        let socket = match TcpSocket::new(family, is_non_block) {
+            Ok(socket) => socket,
+            Err(e) => return this.set_errno_and_return_neg1_i32(e),
+        };
         let fds = &mut this.machine.fds;
-        let fd = fds.new_ref(TcpSocket::new(family, is_non_block));
+        let fd = fds.new_ref(socket);
+
+        // TCP sockets are implemented using host sockets. They thus need
+        // to be registered to the blocking I/O manager directly after creation.
+        this.machine.blocking_io.register(fd.clone());
 
         interp_ok(Scalar::from_i32(fds.insert(fd)))
     }
@@ -352,7 +352,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     address_ptr: Pointer,
                     address_len_ptr: Pointer,
                     dest: MPlaceTy<'tcx>
-                } |this, result: Result<(FdNum, SocketAddr), IoError>| {
+                } |this, result: Result<(FdNum, socket2::SockAddr), IoError>| {
                     let (client_sockfd, address) = match result {
                         Ok(data) => data,
                         Err(e) => return this.set_errno_and_return_neg1(e, &dest),
@@ -764,7 +764,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     address_ptr: Pointer,
                     address_len_ptr: Pointer,
                     dest: MPlaceTy<'tcx>,
-                } |this, result: Result<SocketAddr, IoError>| {
+                } |this, result: Result<socket2::SockAddr, IoError>| {
                     let address = match result {
                         Ok(address) => address,
                         Err(e) => return this.set_errno_and_return_neg1(e, &dest)
