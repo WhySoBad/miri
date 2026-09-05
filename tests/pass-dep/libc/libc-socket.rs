@@ -37,6 +37,8 @@ fn main() {
     test_bind_connected();
     test_bind_listening();
     test_listen();
+    test_listen_connected();
+    test_listen_listening();
 
     test_accept_connect();
     test_connect_error();
@@ -326,6 +328,34 @@ fn test_listen() {
     unsafe {
         errno_check(libc::listen(sockfd, 16));
     }
+}
+
+/// Test that `listen` returns EINVAL for a client TCP socket which
+/// is already connected to a peer socket.
+fn test_listen_connected() {
+    let (server_sockfd, addr) = net::make_listener_ipv4().unwrap();
+    let client_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    net::connect_ipv4(client_sockfd, addr).unwrap();
+    net::accept_ipv4(server_sockfd).unwrap();
+
+    // Connected sockets cannot start listening, thus the operation should
+    // fail with EINVAL.
+    let err = unsafe { errno_result(libc::listen(client_sockfd, 16)).unwrap_err() };
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // Check that it is the right kind of `InvalidInput`.
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+}
+
+/// Test that `listen` succeeds for a server TCP socket which is already
+/// listening.
+fn test_listen_listening() {
+    let (server_sockfd, _) = net::make_listener_ipv4().unwrap();
+
+    // Invoking `listen` multiple times should be allowed as it can be used to change
+    // the backlog value.
+    unsafe { errno_check(libc::listen(server_sockfd, 16)) };
 }
 
 /// Test accepting connections by running a server in a separate thread and connecting clients

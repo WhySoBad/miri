@@ -314,51 +314,81 @@ impl UnixSocketFileDescription for TcpSocket {
     fn listen<'tcx>(
         self: FileDescriptionRef<TcpSocket>,
         communicate_allowed: bool,
-        // Since the backlog value is just a performance hint we can ignore it.
-        _backlog: i32,
+        backlog: i32,
         ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, Result<(), IoError>> {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
         ecx.ensure_not_failed(&self, "listen")?;
 
-        let mut state = self.state.borrow_mut();
+        let state = self.state.borrow();
 
-        match *state {
-            SocketState::Bound(socket_addr) =>
-                match TcpListener::bind(socket_addr) {
-                    Ok(listener) => {
-                        *state = SocketState::Listening(listener);
-                        drop(state);
-
-                        // After invoking `listen` on a TCP socket, it transitions out of the
-                        // TCP_CLOSE state which affects the socket's readiness. Because we
-                        // register the socket afterwards to the blocking I/O manager, we just
-                        // clear its readiness here as the blocking I/O manager will update its
-                        // readiness accordingly.
-                        self.io_readiness.replace(Readiness::EMPTY);
-                        ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
-
-                        // Register the socket to the blocking I/O manager because
-                        // we now have an associated host socket.
-                        ecx.machine.blocking_io.register(self);
-                    }
-                    Err(e) => return interp_ok(Err(IoError::HostError(e))),
-                },
-            SocketState::Initial => {
-                throw_unsup_format!(
-                    "listen: listening on a tcp socket which isn't bound is unsupported"
-                )
-            }
-            SocketState::Listening(_) => {
-                throw_unsup_format!(
-                    "listen: listening on a tcp socket multiple times is unsupported"
-                )
-            }
-            SocketState::Connecting(_) | SocketState::Connected(_) => {
-                throw_unsup_format!("listen: listening on a connected tcp socket is unsupported")
-            }
+        let socket = match &*state {
+            SocketState::Initial(socket) => socket2::SockRef::from(socket),
+            SocketState::Listening(listener) => socket2::SockRef::from(listener),
+            SocketState::Bound(_) => panic!("state will be removed"),
+            // POSIX states that connected sockets cannot start listening.
+            SocketState::Connecting(_) | SocketState::Connected(_) =>
+                return interp_ok(Err(LibcError("EINVAL"))),
             SocketState::ConnectionFailed(_) | SocketState::Transitioning => unreachable!(),
+        };
+
+        if let Err(e) = socket.listen(backlog) {
+            return interp_ok(Err(IoError::HostError(e)));
         }
+
+        if let SocketState::Listening(_) = &*state {
+            // The socket was already listening; we just changed the backlog.
+            // The socket is already registered to the blocking I/O manager
+            // and we also don't need to perform a state transition.
+            return interp_ok(Ok(()));
+        }
+
+        drop(state);
+
+        // Temporarily use dummy state to take ownership of the underlying socket.
+        let SocketState::Initial(socket) = self.state.replace(SocketState::Transitioning) else {
+            unreachable!()
+        };
+
+        // Turn the `socket2::Socket` into a `mio::TcpListener`.
+        // This is the same what Tokio does in their TCP socket implementation:
+        // See <https://github.com/tokio-rs/tokio/blob/2120bee/tokio/src/net/tcp/socket.rs#L906-L925>
+        // SAFETY: mio specifies that it is safe to use `from_raw_fd` and
+        // `from_raw_socket` as long as it's ensured that the socket is non-blocking.
+        // Because we immediately make the socket non-blocking after creation, that
+        // is always guaranteed.
+
+        // FIXME: Rustfmt has a bug where it incorrectly removes the outer braces of {{ .. }} inside
+        // a `cfg_select!` block. See <https://github.com/rust-lang/rustfmt/issues/7045>.
+        #[rustfmt::skip]
+        let listener = cfg_select! {
+            unix => {{
+                use std::os::fd::{IntoRawFd, FromRawFd};
+                let raw_fd = socket.into_raw_fd();
+                unsafe { TcpListener::from_raw_fd(raw_fd) }
+            }},
+            windows => {{
+                use std::os::windows::io::{IntoRawSocket, FromRawSocket};
+                let raw_socket = socket.into_raw_socket();
+                unsafe { TcpListener::from_raw_socket(raw_socket) }
+            }},
+            _ => unreachable!("unsupported host platform")
+        };
+
+        self.state.replace(SocketState::Listening(listener));
+
+        // After invoking `listen` on a TCP socket, it transitions out of the
+        // TCP_CLOSE state which affects the socket's readiness. Because we
+        // register the socket afterwards to the blocking I/O manager, we just
+        // clear its readiness here as the blocking I/O manager will update its
+        // readiness accordingly.
+        self.io_readiness.replace(Readiness::EMPTY);
+        ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
+
+        // Register the socket to the blocking I/O manager because
+        // the readiness of the underlying host socket is no longer
+        // known to always be the initial readiness.
+        ecx.machine.blocking_io.register(self);
 
         interp_ok(Ok(()))
     }
