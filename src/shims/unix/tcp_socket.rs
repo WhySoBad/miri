@@ -441,52 +441,103 @@ impl UnixSocketFileDescription for TcpSocket {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
         ecx.ensure_not_failed(&self, "connect")?;
 
-        match &*self.state.borrow() {
-            SocketState::Initial => { /* fall-through to below */ }
+        let state = self.state.borrow();
+
+        let socket = match &*state {
+            SocketState::Initial(socket) => socket,
+            SocketState::Bound(_) => panic!("state will be removed"),
+            // The socket is already connected or listening.
+            // Subsequent connection attempts return EISCONN for TCP sockets.
+            SocketState::Listening(_) | SocketState::Connected(_) =>
+                return finish.call(ecx, Err(LibcError("EISCONN"))),
             // The socket is already in a connecting state.
+            // Subsequent connection attempts return EALREADY for TCP sockets.
             SocketState::Connecting(_) => return finish.call(ecx, Err(LibcError("EALREADY"))),
-            // We don't return EISCONN for already connected sockets, for which we're
-            // sure that the connection is established, since TCP sockets are usually
-            // allowed to be connected multiple times.
-            _ =>
-                throw_unsup_format!(
-                    "connect: connecting is only supported for tcp sockets which are neither \
-                   bound, listening nor already connected"
-                ),
+            SocketState::ConnectionFailed(_) | SocketState::Transitioning => unreachable!(),
+        };
+
+        let result = socket.connect(&socket2::SockAddr::from(address));
+
+        drop(state);
+
+        // Boolean whether the connection attempt "failed" because it could not be
+        // completed immediately without blocking.
+        let is_in_progress = result.as_ref().is_err_and(|e| {
+            if cfg!(windows) {
+                // On Windows hosts non-blocking connects fail with EWOULDBLOCK when the connection
+                // cannot be established immediately.
+                e.kind() == io::ErrorKind::WouldBlock
+            } else {
+                // On Unix-like hosts non-blocking connects fail with EINPROGRESS when the connection
+                // cannot be established immediately.
+                e.kind() == io::ErrorKind::InProgress
+            }
+        });
+
+        if !is_in_progress && let Err(e) = result {
+            // There was a "real" error during connection establishment.
+            return finish.call(ecx, Err(IoError::HostError(e)));
         }
 
-        // This begins establishing the connection, but does not block until the stream is fully connected.
-        // We deal with that below.
-        match TcpStream::connect(address) {
-            Ok(stream) => {
-                *self.state.borrow_mut() = SocketState::Connecting(stream);
-
-                // After invoking `connect` on a TCP socket, it transitions out of the
-                // TCP_CLOSE state which affects the socket's readiness. Because we
-                // register the socket afterwards to the blocking I/O manager, we just
-                // clear its readiness here as the blocking I/O manager will update its
-                // readiness accordingly.
-                self.io_readiness.replace(Readiness::EMPTY);
-                ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
-
-                // Register the socket to the blocking I/O manager because
-                // we now have an associated host socket.
-                ecx.machine.blocking_io.register(self.clone());
-            }
-            Err(e) => return finish.call(ecx, Err(IoError::HostError(e))),
+        // Temporarily use dummy state to take ownership of the underlying socket.
+        let SocketState::Initial(socket) = self.state.replace(SocketState::Transitioning) else {
+            unreachable!()
         };
+
+        // Turn the `socket2::Socket` into a `mio::TcpStream`.
+        // This is the same what Tokio does in their TCP socket implementation:
+        // See <https://github.com/tokio-rs/tokio/blob/2120bee/tokio/src/net/tcp/socket.rs#L841-L869>
+        // SAFETY: mio specifies that it is safe to use `from_raw_fd` and
+        // `from_raw_socket` as long as it's ensured that the socket is non-blocking.
+        // Because we immediately make the socket non-blocking after creation, that
+        // is always guaranteed.
+
+        // FIXME: Rustfmt has a bug where it incorrectly removes the outer braces of {{ .. }} inside
+        // a `cfg_select!` block. See <https://github.com/rust-lang/rustfmt/issues/7045>.
+        #[rustfmt::skip]
+        let stream = cfg_select! {
+             unix => {{
+                 use std::os::fd::{IntoRawFd, FromRawFd};
+                 let raw_fd = socket.into_raw_fd();
+                 unsafe { TcpStream::from_raw_fd(raw_fd) }
+             }},
+             windows => {{
+                 use std::os::windows::io::{IntoRawSocket, FromRawSocket};
+                 let raw_socket = socket.into_raw_socket();
+                 unsafe { TcpStream::from_raw_socket(raw_socket) }
+             }},
+             _ => unreachable!("unsupported host platform")
+         };
+
+        self.state.replace(SocketState::Connecting(stream));
+
+        // After invoking `connect` on a TCP socket, it transitions out of the
+        // TCP_CLOSE state which affects the socket's readiness. Because we
+        // register the socket afterwards to the blocking I/O manager, we just
+        // clear its readiness here as the blocking I/O manager will update its
+        // readiness accordingly.
+        self.io_readiness.replace(Readiness::EMPTY);
+        ecx.update_fd_readiness(self.clone(), ReadinessUpdateFlags::DEFAULT)?;
+
+        // Register the socket to the blocking I/O manager because
+        // the readiness of the underlying host socket is no longer
+        // known to always be the initial readiness.
+        ecx.machine.blocking_io.register(self.clone());
 
         if self.is_non_block.get() {
             // We have a non-blocking socket and thus don't want to block until
             // the connection is established.
 
-            // Since the [`TcpStream::connect`] function of mio hides the EINPROGRESS
-            // we just always return EINPROGRESS and check whether the connection succeeded
-            // once we want to use the connected socket.
-            finish.call(ecx, Err(LibcError("EINPROGRESS")))
+            if is_in_progress {
+                finish.call(ecx, Err(LibcError("EINPROGRESS")))
+            } else {
+                finish.call(ecx, Ok(()))
+            }
         } else {
             // The socket is in blocking mode and thus the connect call should block
-            // until the connection with the server is established.
+            // until the connection with the server is established. A potential
+            // EWOULDBLOCK or EINPROGRESS error code is ignored as we emulate a
+            // blocking socket.
 
             if self.write_timeout.get().is_some() {
                 // Some Unixes like Linux also apply the SO_SNDTIMEO socket option

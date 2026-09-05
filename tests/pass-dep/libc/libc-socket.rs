@@ -42,6 +42,8 @@ fn main() {
 
     test_accept_connect();
     test_connect_error();
+    test_connect_connected();
+    test_connect_listening();
     test_send_peek_recv();
     test_write_read();
     test_readv();
@@ -421,6 +423,35 @@ fn test_connect_error() {
             | ErrorKind::AddrNotAvailable
             | ErrorKind::NetworkUnreachable
     ));
+}
+
+/// Test that invoking `connect` on an already connected client
+/// TCP socket returns EISCONN.
+fn test_connect_connected() {
+    let (server_sockfd1, addr1) = net::make_listener_ipv4().unwrap();
+    let (_, addr2) = net::make_listener_ipv4().unwrap();
+    let client_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    net::connect_ipv4(client_sockfd, addr1).unwrap();
+    net::accept_ipv4(server_sockfd1).unwrap();
+
+    let err = net::connect_ipv4(client_sockfd, addr2).unwrap_err();
+    // The standard library doesn't provide an error kind for EISCONN;
+    // we thus cannot assert the correct error kind.
+    assert_eq!(err.raw_os_error(), Some(libc::EISCONN));
+}
+
+/// Test that invoking `connect` on an already listening server
+/// TCP socket returns EISCONN.
+fn test_connect_listening() {
+    let (_, addr1) = net::make_listener_ipv4().unwrap();
+    let (server_sockfd2, _) = net::make_listener_ipv4().unwrap();
+
+    let err = net::connect_ipv4(server_sockfd2, addr1).unwrap_err();
+    // The standard library doesn't provide an error kind for EISCONN;
+    // we thus cannot assert the correct error kind.
+    assert_eq!(err.raw_os_error(), Some(libc::EISCONN));
 }
 
 /// Test sending bytes into a connected stream and then peeking and receiving
