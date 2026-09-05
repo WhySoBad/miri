@@ -817,51 +817,26 @@ impl UnixSocketFileDescription for TcpSocket {
         ecx.ensure_not_failed(&self, "getsockname")?;
 
         let state = self.state.borrow();
+        let socket = state.as_socket_ref();
 
-        let address = match &*state {
-            SocketState::Bound(address) => {
-                if address.port() == 0 {
-                    // The socket is bound to a zero-port which means it gets assigned a random
-                    // port. Since we don't yet have an underlying socket, we don't know what this
-                    // random port will be and thus this is unsupported.
-                    throw_unsup_format!(
-                        "getsockname: when the port is 0, getting the tcp socket address before \
-                        calling `listen` or `connect` is unsupported"
-                    )
-                }
+        if cfg!(windows)
+            && let SocketState::Connecting(_) = &*state
+        {
+            // FIXME: On Windows hosts `getsockname` returns `0.0.0.0:0` whilst the socket is connecting:
+            // <https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-getsockname#remarks>
+            // This is problematic because UNIX targets could expect a real local address even
+            // for a connecting non-blocking socket.
 
-                *address
+            static DEDUP: AtomicBool = AtomicBool::new(false);
+            if !DEDUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                ecx.emit_diagnostic(NonHaltingDiagnostic::ConnectingSocketGetsockname);
             }
-            SocketState::Listening(listener) =>
-                match listener.local_addr() {
-                    Ok(address) => address,
-                    Err(e) => return interp_ok(Err(IoError::HostError(e))),
-                },
-            SocketState::Connecting(stream) | SocketState::Connected(stream) => {
-                if cfg!(windows) && matches!(&*state, SocketState::Connecting(_)) {
-                    // FIXME: On Windows hosts `TcpStream::local_addr` returns `0.0.0.0:0` whilst
-                    // the socket is connecting:
-                    // <https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-getsockname#remarks>
-                    // This is problematic because UNIX targets could expect a real local address even
-                    // for a connecting non-blocking socket.
+        }
 
-                    static DEDUP: AtomicBool = AtomicBool::new(false);
-                    if !DEDUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        ecx.emit_diagnostic(NonHaltingDiagnostic::ConnectingSocketGetsockname);
-                    }
-                }
-                match stream.local_addr() {
-                    Ok(address) => address,
-                    Err(e) => return interp_ok(Err(IoError::HostError(e))),
-                }
-            }
-            // For non-bound sockets the POSIX manual says the returned address is unspecified.
-            // Often this is 0.0.0.0:0 and thus we set it to this value.
-            SocketState::Initial => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            SocketState::ConnectionFailed(_) => unreachable!(),
-        };
-
-        interp_ok(Ok(address))
+        match socket.local_addr() {
+            Ok(address) => interp_ok(Ok(address.as_socket().unwrap())),
+            Err(e) => interp_ok(Err(IoError::HostError(e))),
+        }
     }
 
     fn getpeername<'tcx>(
