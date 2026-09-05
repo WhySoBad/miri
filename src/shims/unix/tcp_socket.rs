@@ -591,6 +591,9 @@ impl UnixSocketFileDescription for TcpSocket {
         value_len: u64,
         ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, Result<(), IoError>> {
+        let state = self.state.borrow();
+        let socket = state.as_socket_ref();
+
         if level == ecx.eval_libc_i32("SOL_SOCKET") {
             let opt_so_rcvtimeo = ecx.eval_libc_i32("SO_RCVTIMEO");
             let opt_so_sndtimeo = ecx.eval_libc_i32("SO_SNDTIMEO");
@@ -658,19 +661,7 @@ impl UnixSocketFileDescription for TcpSocket {
                 let option_value = ecx.ptr_to_mplace(value_ptr, ecx.machine.layouts.u32);
                 let ttl = ecx.read_scalar(&option_value)?.to_u32()?;
 
-                let result = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) =>
-                        throw_unsup_format!(
-                            "setsockopt: setting option IP_TTL on level IPPROTO_IP is only supported \
-                           on connected and listening tcp sockets"
-                        ),
-                    SocketState::Listening(listener) => listener.set_ttl(ttl),
-                    SocketState::Connecting(stream) | SocketState::Connected(stream) =>
-                        stream.set_ttl(ttl),
-                    SocketState::ConnectionFailed(_) => unreachable!(),
-                };
-
-                return match result {
+                return match socket.set_ttl_v4(ttl) {
                     Ok(_) => interp_ok(Ok(())),
                     Err(e) => interp_ok(Err(IoError::HostError(e))),
                 };
@@ -690,18 +681,7 @@ impl UnixSocketFileDescription for TcpSocket {
                 let option_value = ecx.ptr_to_mplace(value_ptr, ecx.machine.layouts.i32);
                 let nodelay = ecx.read_scalar(&option_value)?.to_i32()? != 0;
 
-                let result = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) | SocketState::Listening(_) =>
-                        throw_unsup_format!(
-                            "setsockopt: setting option TCP_NODELAY on level IPPROTO_TCP is only supported \
-                           on connected tcp sockets"
-                        ),
-                    SocketState::Connecting(stream) | SocketState::Connected(stream) =>
-                        stream.set_nodelay(nodelay),
-                    SocketState::ConnectionFailed(_) => unreachable!(),
-                };
-
-                return match result {
+                return match socket.set_tcp_nodelay(nodelay) {
                     Ok(_) => interp_ok(Ok(())),
                     Err(e) => interp_ok(Err(IoError::HostError(e))),
                 };
@@ -724,12 +704,17 @@ impl UnixSocketFileDescription for TcpSocket {
         option: i32,
         ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, Result<MPlaceTy<'tcx>, IoError>> {
+        let state = self.state.borrow();
+        let socket = state.as_socket_ref();
+
         if level == ecx.eval_libc_i32("SOL_SOCKET") {
             let opt_so_error = ecx.eval_libc_i32("SO_ERROR");
             let opt_so_rcvtimeo = ecx.eval_libc_i32("SO_RCVTIMEO");
             let opt_so_sndtimeo = ecx.eval_libc_i32("SO_SNDTIMEO");
 
             if option == opt_so_error {
+                drop(state);
+
                 // Reading SO_ERROR should always return the latest async error. Because our stored
                 // `socket.error` could be outdated, we attempt to update it here.
                 ecx.update_last_error(&self);
@@ -783,19 +768,7 @@ impl UnixSocketFileDescription for TcpSocket {
             let opt_ip_ttl = ecx.eval_libc_i32("IP_TTL");
 
             if option == opt_ip_ttl {
-                let ttl = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) =>
-                        throw_unsup_format!(
-                            "getsockopt: reading option IP_TTL on level IPPROTO_IP is only supported \
-                            on connected and listening tcp sockets"
-                        ),
-                    SocketState::Listening(listener) => listener.ttl(),
-                    SocketState::Connecting(stream) | SocketState::Connected(stream) =>
-                        stream.ttl(),
-                    SocketState::ConnectionFailed(_) => unreachable!(),
-                };
-
-                let ttl = match ttl {
+                let ttl = match socket.ttl_v4() {
                     Ok(ttl) => ttl,
                     Err(e) => return interp_ok(Err(IoError::HostError(e))),
                 };
@@ -813,18 +786,7 @@ impl UnixSocketFileDescription for TcpSocket {
             let opt_tcp_nodelay = ecx.eval_libc_i32("TCP_NODELAY");
 
             if option == opt_tcp_nodelay {
-                let nodelay = match &*self.state.borrow() {
-                    SocketState::Initial | SocketState::Bound(_) | SocketState::Listening(_) =>
-                        throw_unsup_format!(
-                            "getsockopt: reading option TCP_NODELAY on level IPPROTO_TCP is only supported \
-                            on connected tcp sockets"
-                        ),
-                    SocketState::Connecting(stream) | SocketState::Connected(stream) =>
-                        stream.nodelay(),
-                    SocketState::ConnectionFailed(_) => unreachable!(),
-                };
-
-                let nodelay = match nodelay {
+                let nodelay = match socket.tcp_nodelay() {
                     Ok(nodelay) => nodelay,
                     Err(e) => return interp_ok(Err(IoError::HostError(e))),
                 };
