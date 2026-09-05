@@ -36,11 +36,9 @@ const INITIAL_TCP_SOCKET_READINESS: Readiness =
 enum SocketState {
     /// No syscall after `socket` has been made.
     Initial(socket2::Socket),
-    /// The `bind` syscall has been called on the socket.
-    /// This is only reachable from the [`SocketState::Initial`] state.
-    Bound(SocketAddr),
     /// The `listen` syscall has been called on the socket.
-    /// This is only reachable from the [`SocketState::Bound`] state.
+    /// This is reachable from the [`SocketState::Initial`] and the
+    /// [`SocketState::Listening`] states.
     Listening(TcpListener),
     /// The `connect` syscall has been called and we weren't yet able
     /// to ensure the connection is established. This is only reachable
@@ -75,7 +73,6 @@ impl SocketState {
     fn as_socket_ref<'a>(&'a self) -> socket2::SockRef<'a> {
         match self {
             SocketState::Initial(socket) => socket.into(),
-            SocketState::Bound(_) => panic!("bound state will be removed"),
             SocketState::Listening(listener) => listener.into(),
             SocketState::Connecting(stream)
             | SocketState::Connected(stream)
@@ -325,7 +322,6 @@ impl UnixSocketFileDescription for TcpSocket {
         let socket = match &*state {
             SocketState::Initial(socket) => socket2::SockRef::from(socket),
             SocketState::Listening(listener) => socket2::SockRef::from(listener),
-            SocketState::Bound(_) => panic!("state will be removed"),
             // POSIX states that connected sockets cannot start listening.
             SocketState::Connecting(_) | SocketState::Connected(_) =>
                 return interp_ok(Err(LibcError("EINVAL"))),
@@ -445,7 +441,6 @@ impl UnixSocketFileDescription for TcpSocket {
 
         let socket = match &*state {
             SocketState::Initial(socket) => socket,
-            SocketState::Bound(_) => panic!("state will be removed"),
             // The socket is already connected or listening.
             // Subsequent connection attempts return EISCONN for TCP sockets.
             SocketState::Listening(_) | SocketState::Connected(_) =>
