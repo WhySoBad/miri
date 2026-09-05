@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell, RefMut};
 use std::io;
 use std::io::Read;
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4};
+use std::net::{Shutdown, SocketAddr};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -59,6 +59,11 @@ enum SocketState {
     /// and thus nothing (except destroying the socket) should be
     /// supported when a socket is in this state.
     ConnectionFailed(TcpStream),
+    /// The socket state machine is transitioning between two states
+    /// which contain an underlying host socket. This state is never
+    /// observable, it's only needed as a placeholder state to safely
+    /// acquire ownership of the underlying host socket.
+    Transitioning,
 }
 
 impl SocketState {
@@ -75,6 +80,7 @@ impl SocketState {
             SocketState::Connecting(stream)
             | SocketState::Connected(stream)
             | SocketState::ConnectionFailed(stream) => stream.into(),
+            SocketState::Transitioning => unreachable!(),
         }
     }
 }
@@ -351,7 +357,7 @@ impl UnixSocketFileDescription for TcpSocket {
             SocketState::Connecting(_) | SocketState::Connected(_) => {
                 throw_unsup_format!("listen: listening on a connected tcp socket is unsupported")
             }
-            SocketState::ConnectionFailed(_) => unreachable!(),
+            SocketState::ConnectionFailed(_) | SocketState::Transitioning => unreachable!(),
         }
 
         interp_ok(Ok(()))
@@ -1432,13 +1438,11 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // The connection is established.
 
                     // Temporarily use dummy state to take ownership of the stream.
-                    let mut state = socket.state.borrow_mut();
-                    let SocketState::Connecting(stream) = std::mem::replace(&mut*state, SocketState::Initial) else {
+                    let SocketState::Connecting(stream) = socket.state.replace(SocketState::Transitioning) else {
                         // At the start of the function we ensured that we're currently connecting.
                         unreachable!()
                     };
-                    *state = SocketState::Connected(stream);
-                    drop(state);
+                    socket.state.replace(SocketState::Connected(stream));
                     action.call(this, Ok(()))
                 }
             ),
@@ -1471,7 +1475,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// state because we know that `socket` can no longer successfully establish a
     /// connection.
     fn update_last_error(&self, socket: &FileDescriptionRef<TcpSocket>) {
-        let mut state = socket.state.borrow_mut();
+        let state = socket.state.borrow_mut();
 
         let new_error =
             state.as_socket_ref().take_error().expect("Reading SO_ERROR should not fail");
@@ -1487,13 +1491,14 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // specification, the socket is now in an unspecified state.
             // We thus change the socket state to `ConnectionFailed`.
 
+            drop(state);
+
             // Temporarily use dummy state to take ownership of the stream.
-            let SocketState::Connecting(stream) =
-                std::mem::replace(&mut *state, SocketState::Initial)
+            let SocketState::Connecting(stream) = socket.state.replace(SocketState::Transitioning)
             else {
                 unreachable!()
             };
-            *state = SocketState::ConnectionFailed(stream);
+            socket.state.replace(SocketState::ConnectionFailed(stream));
         }
     }
 }
