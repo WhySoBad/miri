@@ -1473,14 +1473,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn update_last_error(&self, socket: &FileDescriptionRef<TcpSocket>) {
         let mut state = socket.state.borrow_mut();
 
-        let new_error = match &*state {
-            SocketState::Listening(listener) =>
-                listener.take_error().expect("Reading SO_ERROR should not fail"),
-            SocketState::Connecting(stream) | SocketState::Connected(stream) =>
-                stream.take_error().expect("Reading SO_ERROR should not fail"),
-            SocketState::Initial | SocketState::Bound(_) | SocketState::ConnectionFailed(_) => None,
-        };
-
+        let new_error =
+            state.as_socket_ref().take_error().expect("Reading SO_ERROR should not fail");
         let Some(new_error) = new_error else { return };
 
         // Store the error such that we can return it when
