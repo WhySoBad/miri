@@ -33,6 +33,9 @@ fn main() {
     }
     test_bind_ipv4_invalid_addr_len();
     test_bind_ipv6();
+    test_bind_twice();
+    test_bind_connected();
+    test_bind_listening();
     test_listen();
 
     test_accept_connect();
@@ -234,6 +237,78 @@ fn test_bind_ipv6() {
             size_of::<libc::sockaddr_in6>() as libc::socklen_t,
         ));
     }
+}
+
+/// Test that invoking `bind` on an already bound TCP socket
+/// returns EINVAL.
+fn test_bind_twice() {
+    let sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
+    let err = unsafe {
+        errno_check(libc::bind(
+            sockfd,
+            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ));
+        errno_result(libc::bind(
+            sockfd,
+            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ))
+        .unwrap_err()
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // Check that it is the right kind of `InvalidInput`.
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+}
+
+/// Test that invoking `bind` on an already connected client
+/// TCP socket returns EINVAL.
+fn test_bind_connected() {
+    let (server_sockfd, addr) = net::make_listener_ipv4().unwrap();
+    let client_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    net::connect_ipv4(client_sockfd, addr).unwrap();
+    net::accept_ipv4(server_sockfd).unwrap();
+
+    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
+    let err = unsafe {
+        errno_result(libc::bind(
+            client_sockfd,
+            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ))
+        .unwrap_err()
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // Check that it is the right kind of `InvalidInput`.
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+}
+
+/// Test that invoking `bind` on an already listening server
+/// TCP socket returns EINVAL.
+fn test_bind_listening() {
+    let server_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    unsafe {
+        errno_check(libc::listen(server_sockfd, 16));
+    }
+
+    let addr = net::sock_addr_ipv4(net::IPV4_LOCALHOST, 0);
+    let err = unsafe {
+        errno_result(libc::bind(
+            server_sockfd,
+            (&addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ))
+        .unwrap_err()
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // Check that it is the right kind of `InvalidInput`.
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
 }
 
 fn test_listen() {

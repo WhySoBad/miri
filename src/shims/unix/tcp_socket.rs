@@ -61,6 +61,24 @@ enum SocketState {
     ConnectionFailed(TcpStream),
 }
 
+impl SocketState {
+    /// View the underlying host socket as a [`socket2::SockRef`].
+    ///
+    /// **Note**: Potentially blocking operations need to be performed on the
+    /// underlying [`TcpStream`] and [`TcpListener`] as it would break the mio
+    /// poll on Windows hosts when performed directly on the [`socket2::SockRef`].
+    fn as_socket_ref<'a>(&'a self) -> socket2::SockRef<'a> {
+        match self {
+            SocketState::Initial(socket) => socket.into(),
+            SocketState::Bound(_) => panic!("bound state will be removed"),
+            SocketState::Listening(listener) => listener.into(),
+            SocketState::Connecting(stream)
+            | SocketState::Connected(stream)
+            | SocketState::ConnectionFailed(stream) => stream.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct TcpSocket {
     /// Family of the socket, used to ensure socket only binds/connects to address of
@@ -257,47 +275,34 @@ impl UnixSocketFileDescription for TcpSocket {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
         ecx.ensure_not_failed(&self, "bind")?;
 
-        let mut state = self.state.borrow_mut();
+        let address_family = match &address {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
 
-        match *state {
-            SocketState::Initial => {
-                let address_family = match &address {
-                    SocketAddr::V4(_) => socket2::Domain::IPV4,
-                    SocketAddr::V6(_) => socket2::Domain::IPV6,
-                };
-
-                if self.family != address_family {
-                    // Attempted to bind an address from a family that doesn't match
-                    // the family of the socket.
-                    let err = if matches!(ecx.tcx.sess.target.os, Os::Linux | Os::Android) {
-                        // Linux man page states that `EINVAL` is used when there is an address family mismatch.
-                        // See <https://man7.org/linux/man-pages/man2/bind.2.html>
-                        LibcError("EINVAL")
-                    } else {
-                        // POSIX man page states that `EAFNOSUPPORT` should be used when there is an address
-                        // family mismatch.
-                        // See <https://man7.org/linux/man-pages/man3/bind.3p.html>
-                        LibcError("EAFNOSUPPORT")
-                    };
-                    return interp_ok(Err(err));
-                }
-
-                *state = SocketState::Bound(address);
-            }
-            SocketState::Connecting(_) | SocketState::Connected(_) =>
-                throw_unsup_format!(
-                    "bind: tcp socket is already connected and binding a
-                   connected socket is unsupported"
-                ),
-            SocketState::Bound(_) | SocketState::Listening(_) =>
-                throw_unsup_format!(
-                    "bind: tcp socket is already bound and binding a socket \
-                   multiple times is unsupported"
-                ),
-            SocketState::ConnectionFailed(_) => unreachable!(),
+        if self.family != address_family {
+            // Attempted to bind an address from a family that doesn't match
+            // the family of the socket.
+            let err = if matches!(ecx.tcx.sess.target.os, Os::Linux | Os::Android) {
+                // Linux man page states that `EINVAL` is used when there is an address family mismatch.
+                // See <https://man7.org/linux/man-pages/man2/bind.2.html>
+                LibcError("EINVAL")
+            } else {
+                // POSIX man page states that `EAFNOSUPPORT` should be used when there is an address
+                // family mismatch.
+                // See <https://man7.org/linux/man-pages/man3/bind.3p.html>
+                LibcError("EAFNOSUPPORT")
+            };
+            return interp_ok(Err(err));
         }
 
-        interp_ok(Ok(()))
+        let state = self.state.borrow();
+        let socket = state.as_socket_ref();
+
+        match socket.bind(&socket2::SockAddr::from(address)) {
+            Ok(()) => interp_ok(Ok(())),
+            Err(e) => interp_ok(Err(IoError::HostError(e))),
+        }
     }
 
     fn listen<'tcx>(
