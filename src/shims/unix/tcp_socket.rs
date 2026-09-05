@@ -14,7 +14,7 @@ use rustc_target::spec::Os;
 use crate::shims::files::{EvalContextExt as _, FdNum, FileDescription, FileDescriptionRef};
 use crate::shims::sig::Varargs;
 use crate::shims::unix::UnixFileDescription;
-use crate::shims::unix::socket::{SocketFamily, UnixSocketFileDescription};
+use crate::shims::unix::socket::UnixSocketFileDescription;
 use crate::*;
 
 /// On Linux a TCP socket is initally in the TCP_CLOSE state:
@@ -35,7 +35,7 @@ const INITIAL_TCP_SOCKET_READINESS: Readiness =
 #[derive(Debug)]
 enum SocketState {
     /// No syscall after `socket` has been made.
-    Initial,
+    Initial(socket2::Socket),
     /// The `bind` syscall has been called on the socket.
     /// This is only reachable from the [`SocketState::Initial`] state.
     Bound(SocketAddr),
@@ -65,7 +65,7 @@ enum SocketState {
 pub(super) struct TcpSocket {
     /// Family of the socket, used to ensure socket only binds/connects to address of
     /// same family.
-    family: SocketFamily,
+    family: socket2::Domain,
     /// Current state of the inner socket.
     state: RefCell<SocketState>,
     /// Whether this fd is non-blocking or not.
@@ -91,17 +91,23 @@ pub(super) struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn new(family: SocketFamily, is_non_block: bool) -> Self {
-        TcpSocket {
+    pub fn new(family: socket2::Domain, is_non_block: bool) -> io::Result<Self> {
+        let socket =
+            socket2::Socket::new(family, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        // The underlying host socket needs to be non-blocking. The actual
+        // blocking mode of the socket is stored in `is_non_block`.
+        socket.set_nonblocking(true)?;
+
+        Ok(TcpSocket {
             family,
-            state: RefCell::new(SocketState::Initial),
+            state: RefCell::new(SocketState::Initial(socket)),
             is_non_block: Cell::new(is_non_block),
             io_readiness: RefCell::new(INITIAL_TCP_SOCKET_READINESS),
             error: RefCell::new(None),
             read_timeout: Cell::new(None),
             write_timeout: Cell::new(None),
             watched: ReadinessWatched::default(),
-        }
+        })
     }
 }
 
@@ -256,8 +262,8 @@ impl UnixSocketFileDescription for TcpSocket {
         match *state {
             SocketState::Initial => {
                 let address_family = match &address {
-                    SocketAddr::V4(_) => SocketFamily::IPv4,
-                    SocketAddr::V6(_) => SocketFamily::IPv6,
+                    SocketAddr::V4(_) => socket2::Domain::IPV4,
+                    SocketAddr::V6(_) => socket2::Domain::IPV6,
                 };
 
                 if self.family != address_family {
@@ -1077,8 +1083,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         let family = match addr {
-            SocketAddr::V4(_) => SocketFamily::IPv4,
-            SocketAddr::V6(_) => SocketFamily::IPv6,
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
         };
 
         let fd = this.machine.fds.new_ref(TcpSocket {
