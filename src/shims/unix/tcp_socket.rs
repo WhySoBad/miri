@@ -954,6 +954,24 @@ impl UnixSocketFileDescription for TcpSocket {
         assert!(communicate_allowed, "cannot have `TcpSocket` with isolation enabled!");
         ecx.ensure_not_failed(&self, "getsockname")?;
 
+        if !self.is_bound.get() {
+            // Since Windows returns EINVAL when invoking `getsockname` on
+            // a socket which hasn't been bound yet, we need to manually
+            // return an unspecified address here.
+
+            let address = if self.family == socket2::Domain::IPV4 {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, /* port */ 0))
+            } else {
+                SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::UNSPECIFIED,
+                    /* port */ 0,
+                    /* flowinfo */ 0,
+                    /* scope_id */ 0,
+                ))
+            };
+            return interp_ok(Ok(address));
+        }
+
         let state = self.state.borrow();
         let socket = state.as_socket_ref();
 
