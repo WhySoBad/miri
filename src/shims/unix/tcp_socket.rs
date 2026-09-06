@@ -482,10 +482,23 @@ impl UnixSocketFileDescription for TcpSocket {
 
         let socket = match &*state {
             SocketState::Initial(socket) => socket,
-            // The socket is already connected or listening.
+            SocketState::Listening(_) => {
+                let err = if matches!(ecx.tcx.sess.target.os, Os::Linux | Os::Android) {
+                    // Linux-like targets return EISCONN when attempting to invoke
+                    // `connect` on an already listening socket.
+                    // See <https://man7.org/linux/man-pages/man2/connect.2.html>
+                    LibcError("EISCONN")
+                } else {
+                    // POSIX specifies to return EOPNOTSUPP when attempting to invoke
+                    // `connect` on an already listening socket.
+                    // See <https://man7.org/linux/man-pages/man3/connect.3p.html>
+                    LibcError("EOPNOTSUPP")
+                };
+                return finish.call(ecx, Err(err));
+            }
+            // The socket is already connected.
             // Subsequent connection attempts return EISCONN for TCP sockets.
-            SocketState::Listening(_) | SocketState::Connected(_) =>
-                return finish.call(ecx, Err(LibcError("EISCONN"))),
+            SocketState::Connected(_) => return finish.call(ecx, Err(LibcError("EISCONN"))),
             // The socket is already in a connecting state.
             // Subsequent connection attempts return EALREADY for TCP sockets.
             SocketState::Connecting(_) => return finish.call(ecx, Err(LibcError("EALREADY"))),

@@ -443,15 +443,26 @@ fn test_connect_connected() {
 }
 
 /// Test that invoking `connect` on an already listening server
-/// TCP socket returns EISCONN.
+/// TCP socket returns EOPNOTSUPP on non-Linux-like targets and
+/// EISCONN on Linux-like targets.
 fn test_connect_listening() {
     let (_, addr1) = net::make_listener_ipv4().unwrap();
     let (server_sockfd2, _) = net::make_listener_ipv4().unwrap();
 
     let err = net::connect_ipv4(server_sockfd2, addr1).unwrap_err();
-    // The standard library doesn't provide an error kind for EISCONN;
-    // we thus cannot assert the correct error kind.
-    assert_eq!(err.raw_os_error(), Some(libc::EISCONN));
+
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        // Linux-like targets return EISCONN when attempting to invoke
+        // `connect` on an already listening socket.
+
+        // The standard library doesn't provide an error kind for EISCONN;
+        // we thus cannot assert the correct error kind.
+        assert_eq!(err.raw_os_error(), Some(libc::EISCONN));
+    } else {
+        // POSIX specifies EOPNOTSUPP when attempting to invoke
+        // `connect` on an already listening socket.
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
 }
 
 /// Test sending bytes into a connected stream and then peeking and receiving
