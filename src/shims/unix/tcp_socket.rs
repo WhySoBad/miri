@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell, RefMut};
 use std::io;
 use std::io::Read;
-use std::net::{Shutdown, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -91,6 +91,8 @@ pub(super) struct TcpSocket {
     state: RefCell<SocketState>,
     /// Whether this fd is non-blocking or not.
     is_non_block: Cell<bool>,
+    /// Whether the socket is implicitly or explicitly bound to an address.
+    is_bound: Cell<bool>,
     /// The current blocking I/O readiness of the file description.
     io_readiness: RefCell<Readiness>,
     /// [`Some`] when the socket had an async error which has not yet been fetched via `SO_ERROR`.
@@ -123,6 +125,7 @@ impl TcpSocket {
             family,
             state: RefCell::new(SocketState::Initial(socket)),
             is_non_block: Cell::new(is_non_block),
+            is_bound: Cell::new(false),
             io_readiness: RefCell::new(INITIAL_TCP_SOCKET_READINESS),
             error: RefCell::new(None),
             read_timeout: Cell::new(None),
@@ -302,10 +305,14 @@ impl UnixSocketFileDescription for TcpSocket {
         let state = self.state.borrow();
         let socket = state.as_socket_ref();
 
-        match socket.bind(&socket2::SockAddr::from(address)) {
-            Ok(()) => interp_ok(Ok(())),
-            Err(e) => interp_ok(Err(IoError::HostError(e))),
+        if let Err(e) = socket.bind(&socket2::SockAddr::from(address)) {
+            return interp_ok(Err(IoError::HostError(e)));
         }
+
+        // The socket has been explicitly bound to a local address.
+        self.is_bound.set(true);
+
+        interp_ok(Ok(()))
     }
 
     fn listen<'tcx>(
@@ -328,9 +335,43 @@ impl UnixSocketFileDescription for TcpSocket {
             SocketState::ConnectionFailed(_) | SocketState::Transitioning => unreachable!(),
         };
 
+        if cfg!(windows) && !self.is_bound.get() {
+            // Implicitly binding a TCP socket by invoking `listen` on an
+            // unbound socket causes EINVAL on Windows hosts. We thus
+            // explicitly bind the socket to an unspecified address with
+            // a random port before listening.
+            //
+            // When the subsequent `listen` fails we behave incorrectly
+            // because a previously unbound socket is now bound. However,
+            // since `listen` can only fail for system ressource errors
+            // (e.g., ENOBUFS) this isn't a problem in reality.
+
+            let address = if self.family == socket2::Domain::IPV4 {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, /* port */ 0))
+            } else {
+                SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::UNSPECIFIED,
+                    /* port */ 0,
+                    /* flowinfo */ 0,
+                    /* scope_id */ 0,
+                ))
+            };
+
+            if let Err(e) = socket.bind(&socket2::SockAddr::from(address)) {
+                return interp_ok(Err(IoError::HostError(e)));
+            }
+
+            // We just explicitly bound the socket to a local address.
+            self.is_bound.set(true);
+        }
+
         if let Err(e) = socket.listen(backlog) {
             return interp_ok(Err(IoError::HostError(e)));
         }
+
+        // Listening sockets are always implicitly bound to a local address if they
+        // weren't already bound.
+        self.is_bound.set(true);
 
         if let SocketState::Listening(_) = &*state {
             // The socket was already listening; we just changed the backlog.
@@ -505,6 +546,8 @@ impl UnixSocketFileDescription for TcpSocket {
          };
 
         self.state.replace(SocketState::Connecting(stream));
+        // Connecting sockets are implicitly bound to a local address.
+        self.is_bound.set(true);
 
         // After invoking `connect` on a TCP socket, it transitions out of the
         // TCP_CLOSE state which affects the socket's readiness. Because we
@@ -1115,6 +1158,8 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             family,
             state: RefCell::new(SocketState::Connected(stream)),
             is_non_block: Cell::new(is_client_sock_nonblock),
+            // Connected sockets are implicitly bound to a local address.
+            is_bound: Cell::new(true),
             io_readiness: RefCell::new(Readiness::EMPTY),
             error: RefCell::new(None),
             read_timeout: Cell::new(None),
