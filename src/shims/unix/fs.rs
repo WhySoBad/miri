@@ -536,7 +536,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // O_NOFOLLOW only fails when the trailing component is a symlink;
                 // the entire rest of the path can still contain symlinks.
                 if path.is_symlink() {
-                    return this.set_errno_and_return_neg1_i32(LibcError("ELOOP"));
+                    let err = if matches!(this.tcx.sess.target.os, Os::FreeBsd) {
+                        // FreeBSD violates POSIX and returns EMLINK instead of ELOOP in this case:
+                        // See <https://man.freebsd.org/cgi/man.cgi?query=open&sektion=2&manpath=FreeBSD>
+                        LibcError("EMLINK")
+                    } else {
+                        LibcError("ELOOP")
+                    };
+                    return this.set_errno_and_return_neg1_i32(err);
                 }
             }
         }
@@ -556,7 +563,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             .open(path)
             .map(|file| this.machine.fds.insert_new(FileHandle { file, writable, readable }));
 
-        interp_ok(Scalar::from_i32(this.try_unwrap_io_result(fd)?))
+        match fd {
+            Ok(fd) => interp_ok(Scalar::from_i32(fd)),
+            // FreeBSD violates POSIX and returns EMLINK instead of ELOOP in this case:
+            // See <https://man.freebsd.org/cgi/man.cgi?query=open&sektion=2&manpath=FreeBSD>
+            Err(e)
+                if this.tcx.sess.target.os == Os::FreeBsd
+                    && e.kind() == ErrorKind::FilesystemLoop =>
+                this.set_errno_and_return_neg1_i32(LibcError("EMLINK")),
+            Err(e) => this.set_errno_and_return_neg1_i32(e),
+        }
     }
 
     fn lseek(

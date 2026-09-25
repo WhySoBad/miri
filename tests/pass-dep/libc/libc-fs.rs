@@ -484,9 +484,9 @@ fn test_posix_mkstemp() {
     drop(file);
     remove_file(path).unwrap();
 
-    // Test invalid inputs. We skip this on native macOS since macOS apparently does
-    // not bother to validate inputs.
-    if !cfg!(all(not(miri), target_vendor = "apple")) {
+    // Test invalid inputs. We skip this on native macOS and FreeBSD since those apparently
+    // don't bother to validate inputs.
+    if !cfg!(all(not(miri), any(target_vendor = "apple", target_os = "freebsd"))) {
         let invalid_templates = vec!["foo", "barXX", "XXXXXXbaz", "whatXXXXXXever", "X"];
         for t in invalid_templates {
             let ptr = CString::new(t).unwrap().into_raw();

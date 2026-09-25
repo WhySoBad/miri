@@ -78,5 +78,12 @@ fn test_nofollow_symlink() {
         libc::open(symlink_cpath.as_ptr(), libc::O_NOFOLLOW | libc::O_CLOEXEC)
     })
     .unwrap_err();
-    assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+    if cfg!(target_os = "freebsd") {
+        // FreeBSD returns EMLINK instead of the ELOOP specified by POSIX when
+        // encountering a symlink with O_NOFOLLOW.
+        assert_eq!(err.raw_os_error(), Some(libc::EMLINK));
+    } else {
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
 }
