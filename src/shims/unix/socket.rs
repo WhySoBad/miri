@@ -225,7 +225,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 );
             }
 
-            UdpSocket::new(family, is_non_block).map(|s| this.machine.fds.new_ref(s).as_unix(this))
+            UdpSocket::new(family, is_non_block).map(|s| {
+                let fd = this.machine.fds.new_ref(s);
+                // FIXME: Ideally this should be done inside `UdpSocket::new`, however, changing
+                // the signature of `UdpSocket::new` (and `TcpSocket::new` for consistency) to return
+                // a `FileDescriptionRef<_>` also doesn't feel right.
+                // Add the UDP socket to the blocking I/O manager as we know that
+                // it's always backed by an underlying mio host socket.
+                this.machine.blocking_io.register(fd.clone());
+
+                fd.as_unix(this)
+            })
         } else {
             throw_unsup_format!(
                 "socket: type {:#x} is unsupported, only SOCK_STREAM, \
