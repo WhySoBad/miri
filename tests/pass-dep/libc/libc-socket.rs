@@ -33,6 +33,7 @@ fn main() {
     }
     test_bind_ipv4_invalid_addr_len();
     test_bind_ipv6();
+    test_bind_wrong_address_family();
     test_bind_twice();
     test_bind_connected();
     test_bind_listening();
