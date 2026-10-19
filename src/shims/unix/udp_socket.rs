@@ -104,6 +104,25 @@ impl FileDescription for UdpSocket {
         "udp socket"
     }
 
+    fn read<'tcx>(
+        self: FileDescriptionRef<Self>,
+        communicate_allowed: bool,
+        ptr: Pointer,
+        len: usize,
+        ecx: &mut MiriInterpCx<'tcx>,
+        finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
+    ) -> InterpResult<'tcx> {
+        self.recv(
+            communicate_allowed,
+            ptr,
+            len,
+            /* is_peek */ false,
+            /* is_non_block */ false,
+            ecx,
+            finish,
+        )
+    }
+
     fn write<'tcx>(
         self: FileDescriptionRef<Self>,
         communicate_allowed: bool,
@@ -251,6 +270,28 @@ impl UnixSocketFileDescription for UdpSocket {
         }
 
         let result = ecx.try_non_block_send(&self, ptr, len)?;
+        finish.call(ecx, result)
+    }
+
+    fn recv<'tcx>(
+        self: FileDescriptionRef<Self>,
+        communicate_allowed: bool,
+        ptr: Pointer,
+        len: usize,
+        is_peek: bool,
+        is_non_block: bool,
+        ecx: &mut MiriInterpCx<'tcx>,
+        finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
+    ) -> InterpResult<'tcx> {
+        assert!(communicate_allowed, "cannot have `UdpSocket` with isolation enabled!");
+
+        let is_non_block = is_non_block || self.is_non_block.get();
+
+        if !is_non_block {
+            throw_unsup_format!("send: blocking reads are currently unsupported for UDP sockets");
+        }
+
+        let result = ecx.try_non_block_recv(&self, ptr, len, is_peek)?;
         finish.call(ecx, result)
     }
 
@@ -403,6 +444,41 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.update_fd_readiness(socket.clone(), ReadinessUpdateFlags::DEFAULT)?;
 
                 // On Windows hosts, `send` can return WSAENOTCONN where EAGAIN or EWOULDBLOCK
+                // would be returned on UNIX-like systems. We thus remap this error to an EWOULDBLOCK.
+                interp_ok(Err(IoError::HostError(io::ErrorKind::WouldBlock.into())))
+            }
+            result => interp_ok(result),
+        }
+    }
+
+    /// Attempt to receive bytes from the connected socket in a non-blocking manner.
+    fn try_non_block_recv(
+        &mut self,
+        socket: &FileDescriptionRef<UdpSocket>,
+        buffer_ptr: Pointer,
+        length: usize,
+        should_peek: bool,
+    ) -> InterpResult<'tcx, Result<usize, IoError>> {
+        let this = self.eval_context_mut();
+
+        let host_socket = socket.socket.borrow();
+
+        // This is a *non-blocking* read/peek.
+        let result = this.read_from_host(
+            |buf| {
+                if should_peek { host_socket.peek(buf) } else { host_socket.recv(buf) }
+            },
+            length,
+            buffer_ptr,
+        )?;
+
+        match result {
+            Err(IoError::HostError(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock) => {
+                // We know that the source is not readable so we need to update its readiness.
+                socket.io_readiness.borrow_mut().readable = false;
+                this.update_fd_readiness(socket.clone(), ReadinessUpdateFlags::DEFAULT)?;
+
+                // On Windows hosts, `recv` can return WSAENOTCONN where EAGAIN or EWOULDBLOCK
                 // would be returned on UNIX-like systems. We thus remap this error to an EWOULDBLOCK.
                 interp_ok(Err(IoError::HostError(io::ErrorKind::WouldBlock.into())))
             }
