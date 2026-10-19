@@ -295,7 +295,7 @@ impl FileDescription for Stdout {
         finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
         // We allow writing to stdout even with isolation enabled.
-        let result = ecx.write_to_host(&self.stdout, len, ptr)?;
+        let result = ecx.write_to_host(|bytes| (&self.stdout).write(bytes), len, ptr)?;
         // Stdout is buffered, flush to make sure it appears on the
         // screen.  This is the write() syscall of the interpreted
         // program, we want it to correspond to a write() syscall on
@@ -352,7 +352,7 @@ impl FileDescription for Stderr {
         finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
         // We allow writing to stderr even with isolation enabled.
-        let result = ecx.write_to_host(&self.stderr, len, ptr)?;
+        let result = ecx.write_to_host(|bytes| (&self.stderr).write(bytes), len, ptr)?;
         // No need to flush, stderr is not buffered.
         finish.call(ecx, result)
     }
@@ -478,7 +478,7 @@ impl FileDescription for FileHandle {
             };
             return finish.call(ecx, Err(err));
         }
-        let result = ecx.write_to_host(&self.file, len, ptr)?;
+        let result = ecx.write_to_host(|bytes| (&self.file).write(bytes), len, ptr)?;
         finish.call(ecx, result)
     }
 
@@ -688,14 +688,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Write data to a host `Write` type, with the bytes taken from machine memory.
     fn write_to_host(
         &mut self,
-        mut file: impl io::Write,
+        write_cb: impl FnOnce(&[u8]) -> io::Result<usize>,
         len: usize,
         ptr: Pointer,
     ) -> InterpResult<'tcx, Result<usize, IoError>> {
         let this = self.eval_context_mut();
 
         let bytes = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
-        let result = file.write(bytes);
+        let result = write_cb(bytes);
         interp_ok(result.map_err(IoError::HostError))
     }
 }
