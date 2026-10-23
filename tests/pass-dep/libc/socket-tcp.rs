@@ -46,6 +46,8 @@ fn main() {
     test_connect_listening();
     test_send_peek_recv();
     test_write_read();
+    test_recvfrom_nullptr_origin();
+    test_sendto_empty_dest();
     test_readv();
     test_writev();
 
@@ -535,6 +537,88 @@ fn test_write_read() {
 
         // Write some bytes into the stream.
         libc_utils::write_all(peerfd, TEST_BYTES).unwrap();
+    });
+
+    net::connect_ipv4(client_sockfd, addr).unwrap();
+
+    let mut buffer = [0; TEST_BYTES.len()];
+    libc_utils::read_exact(client_sockfd, &mut buffer).unwrap();
+    assert_eq!(&buffer, TEST_BYTES);
+
+    server_thread.join().unwrap();
+}
+
+/// Test receiving data from a TCP socket using `recvfrom` with
+/// a nullptr address argument.
+fn test_recvfrom_nullptr_origin() {
+    let (server_sockfd, addr) = net::make_listener_ipv4().unwrap();
+    let client_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    // Spawn the server thread.
+    let server_thread = thread::spawn(move || {
+        let (peerfd, _) = net::accept_ipv4(server_sockfd).unwrap();
+
+        // Write some bytes into the stream.
+
+        libc_utils::write_all(peerfd, TEST_BYTES).unwrap();
+    });
+
+    net::connect_ipv4(client_sockfd, addr).unwrap();
+
+    let mut buffer = [0; TEST_BYTES.len()];
+    // We read using `recvfrom` where the address pointer and the
+    // address length pointer are both null pointers.
+    unsafe {
+        libc_utils::read_exact_generic(
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc_utils::NoRetry,
+            |buf, count| {
+                libc::recvfrom(
+                    client_sockfd,
+                    buf,
+                    count,
+                    0,
+                    ptr::null_mut::<libc::sockaddr>(),
+                    ptr::null_mut::<libc::socklen_t>(),
+                )
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(&buffer, TEST_BYTES);
+
+    server_thread.join().unwrap();
+}
+
+/// Test sending data into a TCP socket using `sendto` with an
+/// "empty" destination address (i.e., address nullptr or zero length)
+/// and reading it afterwards.
+fn test_sendto_empty_dest() {
+    let (server_sockfd, addr) = net::make_listener_ipv4().unwrap();
+    let client_sockfd =
+        unsafe { errno_result(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)).unwrap() };
+
+    // Spawn the server thread.
+    let server_thread = thread::spawn(move || {
+        let (peerfd, _) = net::accept_ipv4(server_sockfd).unwrap();
+
+        // Write some bytes into the stream.
+
+        // We write using `sendto` where the destination address pointer
+        // is a null pointer and its length is zero.
+        unsafe {
+            libc_utils::write_all_generic(
+                TEST_BYTES.as_ptr().cast(),
+                TEST_BYTES.len(),
+                libc_utils::NoRetry,
+                |buf, count| {
+                    libc::sendto(peerfd, buf, count, 0, ptr::null_mut::<libc::sockaddr>(), 0)
+                },
+            )
+            .unwrap();
+        }
     });
 
     net::connect_ipv4(client_sockfd, addr).unwrap();
