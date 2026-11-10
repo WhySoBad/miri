@@ -1294,4 +1294,26 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         throw_unsup_format!("getsockopt: option {option:#x} is unsupported for level IPPROTO_TCP");
     }
+
+    /// Get the deadline for an action (e.g. reading or writing).
+    /// When `is_non_block` is [`true`], the returned deadline is "now", i.e.,
+    /// we wake up immediately if the action cannot be completed.
+    /// If `action_timeout` is `Some(duration)`, the returned deadline is in the
+    /// future be the specified `duration`. Otherwise, no deadline ([`None`]) is
+    /// returned, indicating that the action can block indefinitely.
+    fn action_deadline(
+        &self,
+        is_non_block: bool,
+        action_timeout: Option<Duration>,
+    ) -> Option<Deadline> {
+        let ecx = self.eval_context_ref();
+
+        if is_non_block {
+            // Non-blocking sockets always have a zero timeout.
+            Some(ecx.machine.monotonic_clock.now().into())
+        } else {
+            action_timeout
+                .map(|duration| ecx.machine.monotonic_clock.now().add_lossy(duration).into())
+        }
+    }
 }
