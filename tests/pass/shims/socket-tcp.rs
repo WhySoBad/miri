@@ -253,11 +253,12 @@ fn test_sockopt_write_timeout() {
     // By default, writes on blocking sockets should block indefinitely.
     assert_eq!(stream.write_timeout().unwrap(), None);
 
-    let short_write_timeout = Some(Duration::from_millis(40));
-    stream.set_write_timeout(short_write_timeout).unwrap();
-    assert_eq!(stream.write_timeout().unwrap(), short_write_timeout);
+    let short_write_timeout = Duration::from_millis(40);
+    stream.set_write_timeout(Some(short_write_timeout)).unwrap();
+    assert_eq!(stream.write_timeout().unwrap(), Some(short_write_timeout));
 
     let fill_buffer = [1u8; 1024];
+    let before = Instant::now();
     loop {
         match stream.write_all(&fill_buffer) {
             Ok(_) => { /* continue to fill up buffer */ }
@@ -268,6 +269,11 @@ fn test_sockopt_write_timeout() {
             Err(err) => panic!("unexpected error whilst filling up buffer: {err}"),
         }
     }
+    // Ensure that we blocked at least for `short_write_timeout`. The upper bound on the
+    // blocking time is really pessimistic to account for slow CI runners.
+    assert!(
+        before.elapsed() >= short_write_timeout && before.elapsed() < short_write_timeout * 100
+    );
 }
 
 /// Test setting and reading the SO_LINGER socket option.
