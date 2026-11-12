@@ -230,14 +230,18 @@ fn test_sockopt_read_timeout() {
     // By default, reads on blocking sockets should block indefinitely.
     assert_eq!(stream.read_timeout().unwrap(), None);
 
-    let short_read_timeout = Some(Duration::from_millis(40));
-    stream.set_read_timeout(short_read_timeout).unwrap();
-    assert_eq!(stream.read_timeout().unwrap(), short_read_timeout);
+    let short_read_timeout = Duration::from_millis(40);
+    stream.set_read_timeout(Some(short_read_timeout)).unwrap();
+    assert_eq!(stream.read_timeout().unwrap(), Some(short_read_timeout));
 
     let mut buffer = [0u8; 128];
+    let before = Instant::now();
     // This should not block indefinitely and instead return EAGAIN/EWOULDBLOCK.
     let err = stream.read(&mut buffer).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::WouldBlock);
+    // Ensure that we blocked at least for `short_read_timeout`. The upper bound on the
+    // blocking time is really pessimistic to account for slow CI runners.
+    assert!(before.elapsed() >= short_read_timeout && before.elapsed() < short_read_timeout * 100);
 }
 
 /// Test setting and reading the RCVTIMEO socket option.
