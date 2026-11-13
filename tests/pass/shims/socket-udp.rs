@@ -2,8 +2,9 @@
 //@compile-flags: -Zmiri-disable-isolation
 //@run-native
 
+use std::io::ErrorKind;
 use std::net::UdpSocket;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     test_create_ipv4();
@@ -44,18 +45,18 @@ fn test_sockopt_read_timeout() {
     // By default, reads on blocking sockets should block indefinitely.
     assert_eq!(socket.read_timeout().unwrap(), None);
 
-    let short_read_timeout = Some(Duration::from_millis(40));
-    socket.set_read_timeout(short_read_timeout).unwrap();
-    assert_eq!(socket.read_timeout().unwrap(), short_read_timeout);
-
-    /*
-    TODO: Once UDP sockets support reading.
+    let short_read_timeout = Duration::from_millis(40);
+    socket.set_read_timeout(Some(short_read_timeout)).unwrap();
+    assert_eq!(socket.read_timeout().unwrap(), Some(short_read_timeout));
 
     let mut buffer = [0u8; 128];
+    let before = Instant::now();
     // This should not block indefinitely and instead return EAGAIN/EWOULDBLOCK.
-    let err = socket.read(&mut buffer).unwrap_err();
+    let err = socket.recv(&mut buffer).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::WouldBlock);
-    */
+    // Ensure that we blocked at least for `short_read_timeout`. The upper bound on the
+    // blocking time is really pessimistic to account for slow CI runners.
+    assert!(before.elapsed() >= short_read_timeout && before.elapsed() < short_read_timeout * 100);
 }
 
 /// Test setting and reading the RCVTIMEO socket option.
@@ -71,19 +72,8 @@ fn test_sockopt_write_timeout() {
     socket.set_write_timeout(short_write_timeout).unwrap();
     assert_eq!(socket.write_timeout().unwrap(), short_write_timeout);
 
-    /*
-    TODO: Once UDP sockets support writing.
-
-    let fill_buffer = [1u8; 1024];
-    loop {
-        match socket.write_all(&fill_buffer) {
-            Ok(_) => { /* continue to fill up buffer */ }
-            // When we get an EAGAIN/EWOULDBLOCK when writing into a blocking socket,
-            // we know it's because of the write timeout exceeding because the write
-            // buffer is full.
-            Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-            Err(err) => panic!("unexpected error whilst filling up buffer: {err}"),
-        }
-    }
-    */
+    // We cannot test "filling up" the UDP socket buffer since UDP is unreliable.
+    // This means the kernel can report to us that it sent the entire datagram but
+    // on the receiving end it just gets discarded should the buffer be full without
+    // notifying the sender.
 }
