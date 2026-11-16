@@ -3,7 +3,7 @@ use std::str;
 use std::time::Duration;
 
 use rustc_abi::Size;
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_span::Symbol;
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::{Env, Os, Target};
@@ -14,6 +14,7 @@ use self::shims::unix::linux::foreign_items as linux;
 use self::shims::unix::macos::foreign_items as macos;
 use self::shims::unix::netbsd::foreign_items as netbsd;
 use self::shims::unix::solarish::foreign_items as solarish;
+use crate::shims::ShimTable;
 use crate::shims::alloc::EvalContextExt as _;
 use crate::shims::cpu_affinity::EvalContextExt as _;
 use crate::shims::files::FD_LIMIT;
@@ -595,15 +596,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     .check_shim_sig(shim_sig!(extern "C" fn(*_) -> i32), (link_name, abi, args))?;
                 let result = ecx.mkstemp(template)?;
                 ecx.write_scalar(result, dest)?;
-            }
-
-            // Poll
-            "poll" => {
-                let [fds, nfds, timeout] = &ecx.check_shim_sig(
-                    shim_sig!(extern "C" fn(*libc::pollfd, libc::nfds_t, i32) -> i32),
-                    (link_name, abi, args),
-                )?;
-                ecx.poll(fds, nfds, timeout, dest)?;
             }
 
             // Sockets and pipes
@@ -1548,5 +1540,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         interp_ok(EmulateItemResult::NeedsReturn)
+    }
+
+    fn register_shims(tcx: TyCtxt<'tcx>, shims: &mut ShimTable<'tcx>) {
+        MiriInterpCx::register_poll(tcx, shims);
     }
 }
